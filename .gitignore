@@ -5,12 +5,34 @@
 /frontend/dist/
 *.tsbuildinfo
 
+# Ad-hoc cross-builds kept beside the sources (gongyi/hardening experiments)
+/backend/minimax2api_linux_*
+/backend/*.exe
+/dist-*.tgz
+
+# Deploy staging (built by Minimax2api.bat pack)
+/deploy/pack/
+/deploy/*.tar.gz
+/deploy/minimax2api-linux-amd64
+
 # Runtime state: the account pool, client keys and audit log all live here.
 # Committing it would leak live tokens.
 /data/
 
 # Render-check screenshots
 /render-out/
+
+# Captcha grid captures from tools/sweep.mjs debugging
+/captcha-debug/
+
+# Proxy rotation state (mihomo workdir: node cache, geo DB, pid file) and the
+# node-usage ledger written by tools/sweep.mjs
+/tools/.reg-proxy/
+/node-state.json
+
+# Subscription export: carries live node UUIDs / reality keys. Regenerate with
+# `node tools/reg-proxy.mjs gen`; never commit it.
+/tools/reg-proxy.yaml
 
 # Dependencies
 node_modules/
@@ -20,6 +42,14 @@ vendor/
 .env
 .env.*
 !.env.example
+
+# Capture helper config: holds the console address and the admin key. It lives
+# in the repository's parent directory by default; this covers a stray copy.
+capture.local.json
+
+# Credential ledger: raw OAuth tokens appended by tools/login.mjs. Lives in the
+# repository's parent directory; this covers a stray copy inside the repo.
+credentials-local.jsonl
 
 # Agent scratch space (holds machine-local paths and notes)
 .workbuddy-ai/
