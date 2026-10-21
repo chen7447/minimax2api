@@ -6,8 +6,10 @@ import { AccountsPage } from "@/features/accounts/accounts-page";
 import { LoginPage } from "@/features/auth/login-page";
 import { ClientKeysPage } from "@/features/client-keys/client-keys-page";
 import { ApiDocsPage } from "@/features/docs/api-docs-page";
+import { CreditsPage } from "@/features/credits/credits-page";
 import { DashboardPage } from "@/features/dashboard/dashboard-page";
 import { GalleryPage } from "@/features/gallery/gallery-page";
+import { GongyiPage } from "@/features/gongyi/gongyi-page";
 import { ModelsPage } from "@/features/models/models-page";
 import { RequestAuditsPage } from "@/features/request-audits/request-audits-page";
 import { SettingsPage } from "@/features/settings/settings-page";
@@ -26,6 +28,8 @@ export const router = createBrowserRouter([
           { index: true, element: <Navigate to="/dashboard" replace /> },
           { path: "/dashboard", element: <DashboardPage /> },
           { path: "/accounts", element: <AccountsPage /> },
+          { path: "/gongyi", element: <GongyiPage /> },
+          { path: "/credits", element: <CreditsPage /> },
           { path: "/client-keys", element: <ClientKeysPage /> },
           { path: "/models", element: <ModelsPage /> },
           { path: "/gallery", element: <GalleryPage /> },

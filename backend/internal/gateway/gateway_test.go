@@ -80,11 +80,28 @@ func upstreamMedia(urls ...string) string {
 // rejected credential therefore means answering 401 to the handshake, which is
 // what accept returning false does. accept sees every request; stream only sees
 // the message call.
+//
+// It also answers the two-call private upload an image attachment needs: the
+// prepare call mints a policy whose OSS URL points back at this same server, and
+// the OSS POST answers 204. Without it every image request would fail before the
+// turn, which is the point of the flow rather than an accident of the stub.
 func upstreamFunc(accept func(token string) bool, stream func(token string) string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("token")
 		if accept != nil && !accept(token) {
 			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/uploads/prepare"):
+			w.Header().Set("content-type", "application/json")
+			_, _ = fmt.Fprintf(w,
+				`{"object_key":%q,"upload_instruction":{"url":%q,"method":"POST","form_fields":`+
+					`{"key":%q,"OSSAccessKeyId":"stub","policy":"stub","Signature":"stub"}}}`,
+				stubObjectKey, "http://"+r.Host+"/oss", stubObjectKey)
+			return
+		case r.URL.Path == "/oss":
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		if strings.HasSuffix(r.URL.Path, "/message") {
@@ -96,6 +113,11 @@ func upstreamFunc(accept func(token string) bool, stream func(token string) stri
 		_, _ = io.WriteString(w, `{"session_id":"sess_test"}`)
 	}
 }
+
+// stubObjectKey is the key the stub upload mints. It has to look like the UUID
+// the real upstream returns so nothing downstream can accidentally depend on a
+// shorter, human-readable value.
+const stubObjectKey = "11111111-1111-4111-8111-111111111111"
 
 // acceptsEverything is the common stub: every credential works and every answer
 // is the same body.
@@ -430,6 +452,278 @@ func TestChatCompletionsFailsOverToHealthyAccount(t *testing.T) {
 	}
 }
 
+// A drained balance arrives as HTTP 200 with "50110:insufficient balance
+// (1008)" inside the assistant content. The gateway must read it as a
+// failure: cool the account for hours and fail over to a healthy one, never
+// delivering the refusal as if it were the model's answer.
+func TestChatCompletionsFailsOverOnQuotaDrained(t *testing.T) {
+	h := newHarness(t, upstreamFunc(nil, func(token string) string {
+		if token == "token-drained" {
+			return upstreamText("50110:insufficient balance (1008)")
+		}
+		return upstreamText("换号成功")
+	}))
+
+	drained := h.addAccount(t, "drained", "token-drained", 1) // picked first
+	h.addAccount(t, "healthy", "token-good", 50)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-agent",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, h.key)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after failover; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeJSON(t, rec)
+	choices, _ := payload["choices"].([]any)
+	choice, _ := choices[0].(map[string]any)
+	message, _ := choice["message"].(map[string]any)
+	if message["content"] != "换号成功" {
+		t.Fatalf("content = %v, want the healthy account's answer", message["content"])
+	}
+	if strings.Contains(rec.Body.String(), "50110") {
+		t.Fatalf("refusal leaked into the response: %s", rec.Body.String())
+	}
+
+	// A drained quota is not a transient failure: the account is exhausted and
+	// leaves the rotation until credits land — no timed recovery at all.
+	updated, ok := h.store.AccountByID(drained.ID)
+	if !ok {
+		t.Fatal("account disappeared")
+	}
+	if updated.Status != store.StatusExhausted {
+		t.Fatalf("status = %q, want %q", updated.Status, store.StatusExhausted)
+	}
+	if updated.ExhaustedAt.IsZero() {
+		t.Fatal("exhaustedAt not stamped for a drained quota")
+	}
+	if !updated.CooldownUntil.IsZero() {
+		t.Fatalf("cooldownUntil = %s, want zero (exhaustion has no recovery clock)", updated.CooldownUntil)
+	}
+	if !strings.Contains(updated.LastError, "quota") {
+		t.Fatalf("LastError = %q, want the quota-drained explanation", updated.LastError)
+	}
+}
+
+// The streamed variant: the refusal is held back before the first byte, so
+// the client sees one clean stream from the healthy account.
+func TestChatCompletionsStreamFailsOverOnQuotaDrained(t *testing.T) {
+	h := newHarness(t, upstreamFunc(nil, func(token string) string {
+		if token == "token-drained" {
+			return upstreamText("50110:insufficient balance (1008)")
+		}
+		return upstreamText("流式换号成功")
+	}))
+	h.addAccount(t, "drained", "token-drained", 1)
+	h.addAccount(t, "healthy", "token-good", 50)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-agent",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"stream":   true,
+	}, h.key)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body = %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "50110") {
+		t.Fatalf("refusal leaked into the stream: %s", rec.Body.String())
+	}
+	var sawAnswer bool
+	for _, line := range sseDataLines(t, rec) {
+		if line == "[DONE]" {
+			continue
+		}
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+			continue
+		}
+		if choices, _ := chunk["choices"].([]any); len(choices) == 1 {
+			if entry, _ := choices[0].(map[string]any); entry != nil {
+				if delta, _ := entry["delta"].(map[string]any); delta != nil {
+					if delta["content"] == "流式换号成功" {
+						sawAnswer = true
+					}
+				}
+			}
+		}
+	}
+	if !sawAnswer {
+		t.Fatalf("healthy answer missing from stream: %s", rec.Body.String())
+	}
+}
+
+// A reply that merely discusses the failure — quoting its code mid-sentence —
+// must pass through untouched and must not poison the serving account.
+func TestChatCompletionsDeliversAReplyThatQuotesTheQuotaError(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText(
+		"50110 是上游错误码，insufficient balance 表示账号余额不足。",
+	)))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-agent",
+		"messages": []any{map[string]any{"role": "user", "content": "50110 是什么意思？"}},
+	}, h.key)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeJSON(t, rec)
+	choices, _ := payload["choices"].([]any)
+	choice, _ := choices[0].(map[string]any)
+	message, _ := choice["message"].(map[string]any)
+	want := "50110 是上游错误码，insufficient balance 表示账号余额不足。"
+	if message["content"] != want {
+		t.Fatalf("content = %v, want the quoted answer intact", message["content"])
+	}
+}
+
+// upstreamWholeMessage builds a reply that never chunks: the closing
+// whole-message frame restates the answer once.
+func upstreamWholeMessage(text, role string) string {
+	msg, _ := json.Marshal(map[string]any{
+		"type":          7,
+		"agent_message": map[string]any{"role": role, "msg_content": text},
+	})
+	return "data:" + string(msg) + "\n\n" + `data:{"type":9,"finish_reason":"stop"}` + "\n\n"
+}
+
+// The refusal can also arrive without any chunk, restated by the closing
+// whole-message frame. The gate must catch it there too — and a short
+// numeric answer ("2+3?" → "5"), which buffers in the gate until the stream
+// ends, must still be flushed to the caller.
+func TestChatCompletionsCatchesARefusalInTheClosingRestatement(t *testing.T) {
+	h := newHarness(t, upstreamFunc(nil, func(token string) string {
+		if token == "token-drained" {
+			return upstreamWholeMessage("50110:insufficient balance (1008)", "assistant")
+		}
+		return upstreamText("换号成功")
+	}))
+
+	drained := h.addAccount(t, "drained", "token-drained", 1) // picked first
+	h.addAccount(t, "healthy", "token-good", 50)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-agent",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, h.key)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after failover; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeJSON(t, rec)
+	choices, _ := payload["choices"].([]any)
+	choice, _ := choices[0].(map[string]any)
+	message, _ := choice["message"].(map[string]any)
+	if message["content"] != "换号成功" {
+		t.Fatalf("content = %v, want the healthy account's answer", message["content"])
+	}
+	if strings.Contains(rec.Body.String(), "50110") {
+		t.Fatalf("refusal leaked into the response: %s", rec.Body.String())
+	}
+	updated, ok := h.store.AccountByID(drained.ID)
+	if !ok {
+		t.Fatal("account disappeared")
+	}
+	if updated.Status != store.StatusExhausted {
+		t.Fatalf("status = %q, want %q", updated.Status, store.StatusExhausted)
+	}
+	if updated.ExhaustedAt.IsZero() {
+		t.Fatal("exhaustedAt not stamped for a drained quota")
+	}
+}
+
+func TestChatCompletionsStreamDeliversAShortNumericAnswer(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("5")))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.chat(t, map[string]any{
+		"model":    "minimax-agent",
+		"messages": []any{map[string]any{"role": "user", "content": "2+3等于几？只回答数字"}},
+		"stream":   true,
+	}, h.key)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body = %s", rec.Code, rec.Body.String())
+	}
+	var sawFive bool
+	for _, line := range sseDataLines(t, rec) {
+		if line == "[DONE]" {
+			continue
+		}
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+			continue
+		}
+		if choices, _ := chunk["choices"].([]any); len(choices) == 1 {
+			if entry, _ := choices[0].(map[string]any); entry != nil {
+				if delta, _ := entry["delta"].(map[string]any); delta != nil {
+					if delta["content"] == "5" {
+						sawFive = true
+					}
+				}
+			}
+		}
+	}
+	if !sawFive {
+		t.Fatalf("short numeric answer was swallowed by the gate: %s", rec.Body.String())
+	}
+}
+
+func TestQuotaGateClassifiesTheFirstContent(t *testing.T) {
+	tests := []struct {
+		name    string
+		chunks  []string
+		wantHit bool // refusal detected, nothing forwarded
+	}{
+		{"refusal in one chunk", []string{"50110:insufficient balance (1008)"}, true},
+		{"refusal split across chunks", []string{"50110", ":insufficient balance (1008)"}, true},
+		{"normal answer", []string{"中国的首都是北京。"}, false},
+		{"answer opening with digits", []string{"2026: the year in review"}, false},
+		{"code quoted after normal text", []string{"你遇到的 ", "50110:insufficient balance (1008) 是余额不足。"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gate quotaGate
+			forwarded := ""
+			for _, chunk := range tt.chunks {
+				if out, ok := gate.allow(chunk); ok {
+					forwarded += out
+				}
+			}
+			if gate.hit != tt.wantHit {
+				t.Fatalf("hit = %v, want %v (forwarded %q)", gate.hit, tt.wantHit, forwarded)
+			}
+			if tt.wantHit && forwarded != "" {
+				t.Fatalf("refusal text was forwarded: %q", forwarded)
+			}
+		})
+	}
+}
+
+func TestQuotaDrainedTextOnlyMatchesAnOpeningRefusal(t *testing.T) {
+	tests := []struct {
+		text string
+		want bool
+	}{
+		{"50110:insufficient balance (1008)", true},
+		{"  50110:insufficient balance (1008)", true},
+		{"你遇到的 50110:insufficient balance (1008) 是余额不足。", false},
+		{"中国的首都是北京。", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := quotaDrainedText(&minimax.Result{Text: tt.text}); got != tt.want {
+			t.Fatalf("quotaDrainedText(%q) = %v, want %v", tt.text, got, tt.want)
+		}
+	}
+	if quotaDrainedText(nil) {
+		t.Fatal("nil result must not read as drained")
+	}
+}
+
 func TestChatCompletionsReportsNoAccount(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("upstream must not be called when the pool is empty")
@@ -559,6 +853,42 @@ func TestModelsEndpoint(t *testing.T) {
 		if !ids[want] {
 			t.Fatalf("model list is missing %s: %v", want, ids)
 		}
+	}
+}
+
+// A model the upstream no longer serves is hidden from /v1/models and refused
+// by name with an actionable message. Clients and New API channels pin model
+// names and are not always updated in step with a retirement; letting the
+// upstream substitute its default would answer a question nobody asked.
+func TestUnavailableModelIsHiddenAndRefused(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("ok")))
+	h.addAccount(t, "a", "token-a", 0)
+
+	if _, err := h.store.UpdateModel("minimax-m2.7", func(model *store.ModelConfig) {
+		model.Unavailable = true
+	}); err != nil {
+		t.Fatalf("mark unavailable: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("authorization", "Bearer "+h.key)
+	rec := httptest.NewRecorder()
+	h.gateway.Models(rec, req)
+	for _, item := range decodeJSON(t, rec)["data"].([]any) {
+		if entry, _ := item.(map[string]any); entry["id"] == "minimax-m2.7" {
+			t.Error("an unavailable model is still advertised by /v1/models")
+		}
+	}
+
+	rec = h.chat(t, map[string]any{
+		"model":    "minimax-m2.7",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, h.key)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), unavailableModelMessage) {
+		t.Errorf("body = %s, want %q", rec.Body.String(), unavailableModelMessage)
 	}
 }
 
@@ -819,41 +1149,15 @@ func TestImageGenerationsIgnoresTheModelAndCountFields(t *testing.T) {
 	}
 }
 
-// An inline data URI cannot be fetched by the upstream, so the request must be
-// refused with an actionable message rather than forwarded to fail opaquely.
-func TestChatCompletionsRejectsInlineImageWithoutPublicBaseURL(t *testing.T) {
-	h := newHarness(t, acceptsEverything(upstreamText("never reached")))
-	h.addAccount(t, "primary", "token-good", 10)
-
-	rec := h.chat(t, map[string]any{
-		"model": "minimax-agent",
-		"messages": []any{map[string]any{
-			"role": "user",
-			"content": []any{
-				map[string]any{"type": "text", "text": "what is this"},
-				map[string]any{"type": "image_url", "image_url": map[string]any{
-					"url": "data:image/png;base64,iVBORw0KGgo=",
-				}},
-			},
-		}},
-	}, h.key)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "public base URL") {
-		t.Fatalf("error should explain how to fix it: %s", rec.Body.String())
-	}
-}
-
-// A remote image URL is forwarded as an attachment without being downloaded.
-func TestChatCompletionsForwardsRemoteImage(t *testing.T) {
+// An inline data URI is uploaded and attached by the key the upload returned.
+//
+// The upstream stopped accepting an external URL — an attachment must name an
+// object_key the account owns — so the data URI must never reach the message
+// body, and the attachment must be the nested {meta, cloud} shape the live
+// upstream accepted.
+func TestChatCompletionsUploadsInlineImage(t *testing.T) {
 	var body string
-	h := newHarness(t, upstreamFunc(
-		nil,
-		func(string) string { return upstreamText("看到了") },
-	))
-	// Wrap the stub to capture the message payload.
+	h := newHarness(t, upstreamFunc(nil, func(string) string { return upstreamText("看到了") }))
 	original := h.upstream.Config.Handler
 	h.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/message") {
@@ -871,7 +1175,7 @@ func TestChatCompletionsForwardsRemoteImage(t *testing.T) {
 			"content": []any{
 				map[string]any{"type": "text", "text": "what is this"},
 				map[string]any{"type": "image_url", "image_url": map[string]any{
-					"url": "https://example.com/cat.png",
+					"url": "data:image/png;base64,iVBORw0KGgo=",
 				}},
 			},
 		}},
@@ -880,8 +1184,70 @@ func TestChatCompletionsForwardsRemoteImage(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(body, "https://example.com/cat.png") {
-		t.Fatalf("message body should carry the remote image: %s", body)
+	if !strings.Contains(body, stubObjectKey) {
+		t.Fatalf("message body should carry the uploaded object key: %s", body)
+	}
+	if !strings.Contains(body, `"cloud"`) || !strings.Contains(body, `"attachment_type":"image"`) {
+		t.Fatalf("attachment should be the nested {meta, cloud} shape: %s", body)
+	}
+	if strings.Contains(body, "data:image/png") {
+		t.Fatalf("the data URI must not be forwarded: %s", body)
+	}
+}
+
+// A malformed inline image is a 400 from the gateway, before any upstream call.
+func TestChatCompletionsRejectsMalformedInlineImage(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("never reached")))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.chat(t, map[string]any{
+		"model": "minimax-agent",
+		"messages": []any{map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "what is this"},
+				map[string]any{"type": "image_url", "image_url": map[string]any{
+					"url": "data:image/png;base64,not-valid-base64!!",
+				}},
+			},
+		}},
+	}, h.key)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "base64") {
+		t.Fatalf("error should name the payload problem: %s", rec.Body.String())
+	}
+}
+
+// A remote image URL is refused, not fetched.
+//
+// The upstream only accepts an image uploaded from the request, so fetching a
+// caller-supplied address would be the gateway inventing a capability — and it
+// would aim the gateway's own network access at wherever the caller points it.
+func TestChatCompletionsRejectsRemoteImageURL(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("never reached")))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	rec := h.chat(t, map[string]any{
+		"model": "minimax-agent",
+		"messages": []any{map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "what is this"},
+				map[string]any{"type": "image_url", "image_url": map[string]any{
+					"url": "https://example.com/cat.png",
+				}},
+			},
+		}},
+	}, h.key)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "data: URI") {
+		t.Fatalf("error should say what to send instead: %s", rec.Body.String())
 	}
 }
 
@@ -1282,4 +1648,3 @@ func TestVideoGenerationsSurvivesADriveThatDoesNotAnswer(t *testing.T) {
 		t.Errorf("the agent's own answer was dropped: %v", payload["detail"])
 	}
 }
-

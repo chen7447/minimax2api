@@ -300,7 +300,7 @@ func TestOpeningARepairedSettingsFileWritesTheRepairBack(t *testing.T) {
 	seeded.Upstream.AgentID = "general"
 	raw, err := json.Marshal(State{
 		Version:  schemaVersion,
-		Admin:    Admin{Username: "admin", Salt: "seeded", PasswordHash: "seeded"},
+		Admin:    Admin{Username: "admin", Salt: "seeded", KeyHash: "seeded"},
 		Settings: seeded,
 		Models:   BuiltinModels(),
 	})
@@ -382,7 +382,7 @@ func TestOpeningAnOlderCatalogueAddsNewBuiltins(t *testing.T) {
 
 	raw, err := json.Marshal(State{
 		Version:  schemaVersion,
-		Admin:    Admin{Username: "admin", Salt: "seeded", PasswordHash: "seeded"},
+		Admin:    Admin{Username: "admin", Salt: "seeded", KeyHash: "seeded"},
 		Settings: config.DefaultSettings(dir),
 		Models:   older,
 	})
@@ -515,6 +515,7 @@ func TestMergeBuiltinModelsBackfillsUpstreamModel(t *testing.T) {
 func TestBuiltinModelsCoverTheUpstreamSelector(t *testing.T) {
 	want := map[string]string{
 		"minimax-agent":              "",
+		"minimax-m3.1-flash":         "MiniMax-M3.1-Flash",
 		"minimax-m3.1-flash-preview": "MiniMax-M3.1-Flash-Preview",
 		"minimax-m3":                 "MiniMax-M3",
 		"minimax-m3-thinking":        "",

@@ -87,3 +87,65 @@ func TestNormalizeLeavesDeliberateOverridesAlone(t *testing.T) {
 		})
 	}
 }
+
+// The upstream transport is a switch, and the two ways of getting it wrong are
+// both silent: reading "direct" as the agent transport quietly removes tool
+// calling, and reading a blank value as "direct" moves an install that was
+// serving chat onto a protocol it was never tested against.
+func TestUpstreamModeNormalisation(t *testing.T) {
+	cases := []struct {
+		name  string
+		store string
+		want  string
+	}{
+		{"blank is the transport this install already used", "", ModeAgent},
+		{"the agent transport is kept", ModeAgent, ModeAgent},
+		{"the model transport is kept", ModeDirect, ModeDirect},
+		{"case and padding do not decide the transport", "  DiReCt ", ModeDirect},
+		{"an unrecognised value falls back to the agent transport", "nonsense", ModeAgent},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			settings := Settings{}
+			settings.Upstream.Mode = tc.store
+			settings.Normalize(t.TempDir())
+			if settings.Upstream.Mode != tc.want {
+				t.Fatalf("mode = %q, want %q", settings.Upstream.Mode, tc.want)
+			}
+		})
+	}
+}
+
+// UsesDirectModelAPI is read on the request path, where a settings snapshot may
+// not have been through Normalize yet — so it has to decide for itself rather
+// than trusting the stored value to be canonical.
+func TestUsesDirectModelAPIToleratesUnnormalisedValues(t *testing.T) {
+	cases := map[string]bool{
+		"":           false,
+		ModeAgent:    false,
+		ModeDirect:   true,
+		"DIRECT":     true,
+		"  direct  ": true,
+		"direct-ish": false,
+	}
+	for value, want := range cases {
+		settings := Settings{}
+		settings.Upstream.Mode = value
+		if got := settings.UsesDirectModelAPI(); got != want {
+			t.Errorf("UsesDirectModelAPI(%q) = %v, want %v", value, got, want)
+		}
+	}
+}
+
+// The direct transport's paths have to survive a blank settings file, or an
+// install that never opened the console would post every turn to an empty URL.
+func TestDirectPathsHaveDefaults(t *testing.T) {
+	settings := Settings{}
+	settings.Normalize(t.TempDir())
+	if settings.Upstream.ModelPath != DefaultSettings("").Upstream.ModelPath {
+		t.Fatalf("model path = %q", settings.Upstream.ModelPath)
+	}
+	if settings.Upstream.ModelsPath != DefaultSettings("").Upstream.ModelsPath {
+		t.Fatalf("models path = %q", settings.Upstream.ModelsPath)
+	}
+}

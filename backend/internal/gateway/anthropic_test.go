@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"minimax2api/internal/store"
 )
 
 // Anthropic front-end tests.
@@ -152,6 +155,31 @@ func TestAnthropicMessagesHonoursAKnownModelName(t *testing.T) {
 	body := decodeJSON(t, rec)
 	if body["model"] != "minimax-m3-thinking" {
 		t.Fatalf("known model was not honoured: %v", body["model"])
+	}
+}
+
+// A retired model must be refused, not silently resolved to a fallback. The
+// client pinned the name; an answer from another model is worse than an error.
+func TestAnthropicMessagesRefusesARetiredModel(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("ok")))
+	h.addAccount(t, "a", "token-a", 0)
+
+	if _, err := h.store.UpdateModel("minimax-m2.7", func(model *store.ModelConfig) {
+		model.Unavailable = true
+	}); err != nil {
+		t.Fatalf("mark unavailable: %v", err)
+	}
+
+	rec := h.anthropic(t, map[string]any{
+		"model":    "minimax-m2.7",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, h.key)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), unavailableModelMessage) {
+		t.Errorf("body = %s, want %q", rec.Body.String(), unavailableModelMessage)
 	}
 }
 
@@ -357,14 +385,27 @@ func TestAnthropicMessagesCarriesSystemAndToolResultsIntoThePrompt(t *testing.T)
 // An image block is the one part of an Anthropic conversation that is not text,
 // and it has to survive the translation as an image rather than being dropped.
 func TestAnthropicMessagesForwardsImageBlocks(t *testing.T) {
+	var body string
 	h := newHarness(t, acceptsEverything(upstreamText("看到了")))
+	original := h.upstream.Config.Handler
+	h.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/message") {
+			raw, _ := io.ReadAll(r.Body)
+			body = string(raw)
+		}
+		original.ServeHTTP(w, r)
+	})
 	h.addAccount(t, "a", "token-a", 0)
 
 	rec := h.anthropic(t, map[string]any{
 		"model": "minimax-agent",
 		"messages": []any{map[string]any{"role": "user", "content": []any{
 			map[string]any{"type": "text", "text": "这是什么"},
-			map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": "https://example.com/cat.png"}},
+			// A base64 source, so the test stays off the network: the image is
+			// uploaded to the stub rather than fetched from a real host.
+			map[string]any{"type": "image", "source": map[string]any{
+				"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo=",
+			}},
 		}}},
 	}, h.key)
 
@@ -374,5 +415,8 @@ func TestAnthropicMessagesForwardsImageBlocks(t *testing.T) {
 	content := anthropicContentOf(t, rec)
 	if len(content) == 0 || content[0]["text"] != "看到了" {
 		t.Fatalf("content = %v", content)
+	}
+	if !strings.Contains(body, stubObjectKey) {
+		t.Fatalf("the image block should be uploaded and attached: %s", body)
 	}
 }

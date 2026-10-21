@@ -1,4 +1,8 @@
 const TOKEN_KEY = "minimax2api:admin-token";
+// The admin key itself, kept so the console can silently re-login when the
+// server-side session is gone (restart or TTL). Server sessions are in-memory
+// only, so the session token alone can never survive them.
+const KEY_STORAGE = "minimax2api:admin-key";
 
 export function readToken(): string {
   try {
@@ -12,6 +16,23 @@ export function writeToken(token: string): void {
   try {
     if (token) window.localStorage.setItem(TOKEN_KEY, token);
     else window.localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    return;
+  }
+}
+
+export function readStoredKey(): string {
+  try {
+    return window.localStorage.getItem(KEY_STORAGE) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function writeStoredKey(key: string): void {
+  try {
+    if (key) window.localStorage.setItem(KEY_STORAGE, key);
+    else window.localStorage.removeItem(KEY_STORAGE);
   } catch {
     return;
   }

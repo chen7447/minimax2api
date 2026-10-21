@@ -1,6 +1,6 @@
 import { apiRequest } from "@/shared/api/client";
 
-export type AccountStatus = "active" | "cooldown" | "disabled" | "invalid";
+export type AccountStatus = "active" | "cooldown" | "disabled" | "invalid" | "exhausted";
 export type AccountKind = "token" | "guest";
 
 /**
@@ -85,6 +85,7 @@ export type AccountDTO = {
   maxConcurrent: number;
   inflight: number;
   cooldownUntil: string;
+  exhaustedAt: string;
   failCount: number;
   successCount: number;
   lastUsedAt: string;
@@ -109,6 +110,7 @@ export type AccountSummary = {
   cooldown: number;
   disabled: number;
   invalid: number;
+  exhausted: number;
   routable: number;
 };
 
@@ -228,6 +230,52 @@ export function listAccountGroups(): Promise<{ groups: string[] }> {
   return apiRequest("/admin/api/accounts/groups");
 }
 
+// ---------------------------------------------------------- credential capture
+
+/**
+ * State of a browser credential capture.
+ *
+ * "idle" is not a session state — it is the absence of one, and it is what the
+ * console sees before anything was attempted. The terminal states stay on the
+ * server until the next capture starts, so the dialog can show what happened
+ * instead of blanking the moment the operation ends.
+ */
+export type CaptureState = "idle" | "waiting" | "delivered" | "cancelled" | "expired";
+
+/**
+ * One capture session, as the console polls it.
+ *
+ * `helperOnline` reports whether the local helper polled recently — the console
+ * cannot see that machine directly, so this is inferred from its heartbeat.
+ * `region` is the site the operator chose, and it is what the captured account
+ * is filed under: a token from one deployment is rejected by the other.
+ */
+export type CaptureSession = {
+  id: string;
+  region: AccountRegion | "";
+  state: CaptureState;
+  /** Null while idle: there is no session to time. */
+  createdAt: string | null;
+  expiresAt: string | null;
+  helperOnline: boolean;
+  accountID: string;
+  account: string;
+  updated: boolean;
+  error: string;
+};
+
+export function startCapture(region: AccountRegion): Promise<{ capture: CaptureSession }> {
+  return apiRequest("/admin/api/capture", { method: "POST", body: { region } });
+}
+
+export function getCapture(): Promise<{ capture: CaptureSession }> {
+  return apiRequest("/admin/api/capture");
+}
+
+export function cancelCapture(id: string): Promise<{ capture: CaptureSession }> {
+  return apiRequest(`/admin/api/capture/${id}/cancel`, { method: "POST" });
+}
+
 // ------------------------------------------------------------------- sign-in
 
 export type SigninAccountResult = {
@@ -275,11 +323,30 @@ export function getSigninOverview(): Promise<SigninOverview> {
 }
 
 /**
- * Triggers a sweep now. Rejects with a 409 when one is already in flight, which
- * the caller should surface as "please wait" rather than as a failure.
+ * Triggers a sweep now and returns immediately: the sweep itself runs in the
+ * background, because a pool big enough to need this button takes minutes to
+ * walk and no HTTP hop in front of the console will hold the connection that
+ * long. The console watches `running` on the overview and the report that
+ * lands in `lastReport` when the sweep finishes. Rejects with a 409 when one
+ * is already in flight, which the caller should surface as "please wait"
+ * rather than as a failure.
  */
-export function runSignin(): Promise<{ report: SigninReport; nextRunAt: string }> {
+export function runSignin(): Promise<{ started: boolean; total: number; nextRunAt: string }> {
   return apiRequest("/admin/api/signin/run", { method: "POST" });
+}
+
+/**
+ * Kicks off a pool-wide token renewal pass, detached like runSignin. The
+ * backend renews only tokens inside the 3-day expiry window, so a healthy
+ * pool finishes in seconds. 409 when one is already in flight.
+ */
+export function runRenewAll(): Promise<{ started: boolean }> {
+  return apiRequest("/admin/api/renew/run", { method: "POST" });
+}
+
+/** Renews one account's token; returns the new expiry. */
+export function renewAccount(id: string): Promise<{ expiresAt: string; account: AccountDTO }> {
+  return apiRequest(`/admin/api/accounts/${id}/renew`, { method: "POST" });
 }
 
 export function signinAccount(id: string): Promise<{ result: SigninAccountResult; account: AccountDTO }> {
@@ -288,4 +355,8 @@ export function signinAccount(id: string): Promise<{ result: SigninAccountResult
 
 export function refreshCredit(id: string): Promise<{ credit: AccountCredit; account: AccountDTO }> {
   return apiRequest(`/admin/api/accounts/${id}/credit`, { method: "POST" });
+}
+
+export function activateAccount(id: string): Promise<{ account: AccountDTO }> {
+  return apiRequest(`/admin/api/accounts/${id}/activate`, { method: "POST" });
 }

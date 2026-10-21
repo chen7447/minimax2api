@@ -25,6 +25,17 @@ import (
 // Version is reported by /health.
 const Version = "0.1.0"
 
+// unavailableModelMessage is what a caller sees when the catalogue knows the id
+// but the upstream no longer serves it.
+//
+// It is deliberately actionable. Model names are pinned in places this gateway
+// cannot reach — New API channel settings, an agent client's own model list —
+// and those are not always updated in step with the upstream's retirements.
+// Silently substituting another model, which is what the upstream itself does,
+// is worse: the caller would get plausible answers from a model it did not ask
+// for.
+const unavailableModelMessage = "该模型已不可调用，请及时更新新模型"
+
 // Gateway exposes the OpenAI-compatible surface.
 type Gateway struct {
 	store    *store.Store
@@ -79,11 +90,34 @@ type chatRequest struct {
 	Stream   bool          `json:"stream"`
 	User     string        `json:"user"`
 	Tools    []toolSpec    `json:"tools"`
+	// MaxTokens and MaxCompletionTokens are the two spellings clients use for
+	// the same thing. The model transport requires an output limit, so whichever
+	// one arrives is honoured and the default fills in when neither does.
+	MaxTokens           int `json:"max_tokens"`
+	MaxCompletionTokens int `json:"max_completion_tokens"`
 }
 
+// maxTokens resolves the output limit a request asked for.
+func (r chatRequest) maxTokens() int {
+	if r.MaxCompletionTokens > 0 {
+		return r.MaxCompletionTokens
+	}
+	return r.MaxTokens
+}
+
+// chatMessage is one turn as an OpenAI client sends it.
+//
+// The tool fields are what make a tool loop possible at all: an assistant turn
+// carries the calls it made, and each result comes back as a `tool` message
+// naming the call it answers. The agent transport renders both into prose
+// (tools.go explains why), but the model transport forwards them as
+// `tool_use` / `tool_result` blocks — see direct.go.
 type chatMessage struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+	Role       string           `json:"role"`
+	Content    json.RawMessage  `json:"content"`
+	ToolCalls  []openAIToolCall `json:"tool_calls"`
+	ToolCallID string           `json:"tool_call_id"`
+	Name       string           `json:"name"`
 }
 
 type contentPart struct {
@@ -131,6 +165,15 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(out, http.StatusBadRequest, fmt.Sprintf("unknown or disabled model %q", modelID))
 		return
 	}
+	if model.Unavailable {
+		writeError(out, http.StatusBadRequest, unavailableModelMessage+"（"+modelID+"）")
+		return
+	}
+	// The public pool is a translation-only surface: one model, no thinking.
+	if key.Pool == "gongyi" && model.ID != "minimax-m3" {
+		writeError(out, http.StatusBadRequest, "public pool only supports minimax-m3")
+		return
+	}
 	// Every catalogue type is reachable here, and that is the point of the
 	// catalogue rather than an accident. `/v1/models` cannot say what a model
 	// *is* — the schema is id/object/created/owned_by and nothing else — so a
@@ -163,6 +206,18 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The model transport takes the conversation as it stands — messages, tool
+	// declarations, tool results — so none of the flattening below applies to
+	// it. It is gated on the model *type*, not just on the mode: image and video
+	// turns belong to the agent's plugin layer (a video entry is rewritten into
+	// a `@video-creater` reference by outgoingText), and the model endpoint has
+	// no such thing. A video request must keep reaching the agent even when the
+	// install has switched its chat traffic over. See direct.go.
+	if g.directMode() && model.Type == store.ModelTypeChat {
+		g.chatDirect(out, r, key, model, request, body, started)
+		return
+	}
+
 	// Every catalogue entry reaches the same upstream agent, so the model id is
 	// not forwarded. It only steers local behaviour: the thinking variant asks
 	// the adapter to surface the reasoning stream, and a video entry rewrites the
@@ -186,6 +241,11 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	splitter := newToolSplitter(toolsEnabled)
 	var onDelta, onThinking func(string)
 
+	// committed marks answer bytes actually forwarded to the caller. The role
+	// frame does not count: until the answer itself starts, a failed attempt
+	// can fail over cleanly, which is how a balance refusal the gate swallowed
+	// gets retried on a funded account.
+	var committed bool
 	var chunkMu sync.Mutex
 	writeChunk := func(delta map[string]any, finish any) {
 		chunkMu.Lock()
@@ -198,29 +258,33 @@ func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if request.Stream {
 		onDelta = func(text string) {
 			if safe := splitter.push(text); safe != "" {
+				committed = true
 				writeChunk(map[string]any{"content": safe}, nil)
 			}
 		}
 		onThinking = func(text string) {
+			committed = true
 			writeChunk(map[string]any{"reasoning_content": text}, nil)
 		}
 		// The role frame opens the message and goes out before the upstream is
-		// called. That also means a streaming request has committed by the time
-		// its first attempt is made: a retry would append a second answer to a
-		// message the caller has already begun reading.
+		// called, so the caller can begin reading. A retry at that stage merely
+		// continues the same, still-empty message; only once answer bytes have
+		// gone out would a retry append a second answer to a half-read one.
 		writeChunk(map[string]any{"role": "assistant", "content": ""}, nil)
 	}
 
 	turn, lastErr := g.runTurn(r.Context(), turnRequest{
-		Prompt:     prompt,
-		Images:     images,
-		Mode:       mode,
-		Model:      model,
-		SessionKey: request.User,
-		Started:    started,
-		OnDelta:    onDelta,
-		OnThinking: onThinking,
-		Committed:  func() bool { return out.wroteHeader },
+		Prompt:          prompt,
+		Images:          images,
+		Mode:            mode,
+		Model:           model,
+		SessionKey:      request.User,
+		Group:           key.Pool,
+		DisableThinking: key.Pool == "gongyi",
+		Started:         started,
+		OnDelta:         onDelta,
+		OnThinking:      onThinking,
+		Committed:       func() bool { return committed },
 	})
 
 	accountName := turn.AccountName
@@ -325,9 +389,12 @@ type turnRequest struct {
 	Mode       string
 	Model      *store.ModelConfig
 	SessionKey string
-	Started    time.Time
-	OnDelta    func(string)
-	OnThinking func(string)
+	// Group is the client key's pool ("" = personal, "gongyi" = public).
+	Group           string
+	DisableThinking bool
+	Started         time.Time
+	OnDelta         func(string)
+	OnThinking      func(string)
 	// Committed reports whether the response has already begun. A retry is only
 	// safe while nothing has been written: once the caller has seen a byte, a
 	// second account would append a second answer to the first.
@@ -342,6 +409,83 @@ type turnResult struct {
 	FirstToken  int64
 	Retries     int
 	Streamed    bool
+}
+
+// quotaSignature is the prefix of MiniMax's in-content balance failure. The
+// upstream answers HTTP 200 and puts "50110:insufficient balance (1008)" in
+// the assistant text, so an error check on the transport never sees it.
+const quotaSignature = "50110:insufficient balance"
+
+// quotaCodePrefix is the looser verdict for the assembled reply: an answer
+// that opens with the 50110 code is a refusal whatever follows. Matching only
+// the opening keeps a reply that merely discusses the error — its code quoted
+// mid-sentence — from poisoning a healthy account with a drained verdict.
+const quotaCodePrefix = "50110:"
+
+// quotaDrainedText reports whether an aggregated upstream answer is actually
+// a balance refusal. Checked on the assembled text for both streaming and
+// non-streaming calls; the streamed path additionally gates the deltas.
+func quotaDrainedText(result *minimax.Result) bool {
+	if result == nil {
+		return false
+	}
+	return quotaDrainedAnswer(result.Text)
+}
+
+// quotaDrainedAnswer is the same verdict for a caller that has the text but not
+// a Result — the direct transport returns its own result type.
+func quotaDrainedAnswer(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), quotaCodePrefix)
+}
+
+// quotaGate holds back the first bytes of a stream until they can no longer
+// be the quota signature. Balance refusals are short and arrive first, so a
+// normal answer is delayed by at most one small chunk, while the error never
+// reaches the client and the request can silently fail over to another
+// account.
+type quotaGate struct {
+	pending string
+	open    bool // decided "not the error" — forward everything from here on
+	hit     bool // decided "is the error" — swallow the rest
+}
+
+// allow buffers text until the quota verdict is decidable. It returns the
+// text to forward (possibly more than was passed in, once) and whether to
+// forward at all.
+func (g *quotaGate) allow(text string) (string, bool) {
+	switch {
+	case g.hit:
+		return "", false
+	case g.open:
+		return text, true
+	}
+	g.pending += text
+	if len(g.pending) < len(quotaSignature) && strings.HasPrefix(quotaSignature, g.pending) {
+		return "", false // still ambiguous — keep buffering
+	}
+	if strings.HasPrefix(g.pending, quotaSignature) {
+		g.hit = true
+		return "", false
+	}
+	g.open = true
+	out := g.pending
+	g.pending = ""
+	return out, true
+}
+
+// flush returns text the gate was still holding when the upstream stream
+// ended. A ended stream resolves the ambiguity — whatever is buffered is
+// either already judged a refusal (hit) or is ordinary answer text that
+// happens to open with the signature's digits. Flushed text is ordinary:
+// a hit must stay swallowed.
+func (g *quotaGate) flush() (string, bool) {
+	if g.hit || g.pending == "" {
+		return "", false
+	}
+	out := g.pending
+	g.pending = ""
+	g.open = true
+	return out, true
 }
 
 // runTurn leases an account, calls the upstream, and retries across accounts
@@ -371,7 +515,7 @@ func (g *Gateway) runTurn(ctx context.Context, req turnRequest) (*turnResult, er
 
 	var lastErr error
 	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
-		lease, err := g.pool.Acquire(ctx, req.SessionKey)
+		lease, err := g.pool.Acquire(ctx, req.SessionKey, req.Group)
 		if err != nil {
 			return out, err
 		}
@@ -381,17 +525,26 @@ func (g *Gateway) runTurn(ctx context.Context, req turnRequest) (*turnResult, er
 		}
 
 		opts := minimax.Options{
-			Credential:  CredentialOf(lease.Account),
-			Text:        req.Prompt,
-			Mode:        req.Mode,
-			Images:      req.Images,
-			Timeout:     timeoutFor(settings, req.Model),
-			IdleTimeout: settings.StreamIdleTimeout(),
+			Credential:      CredentialOf(lease.Account),
+			Text:            req.Prompt,
+			Mode:            req.Mode,
+			Images:          req.Images,
+			Timeout:         timeoutFor(settings, req.Model),
+			IdleTimeout:     settings.StreamIdleTimeout(),
+			DisableThinking: req.DisableThinking,
 		}
+		var gate *quotaGate
+		emit := req.OnDelta
 		if req.OnDelta != nil {
-			opts.OnDelta = func(text string) {
+			gate = &quotaGate{}
+			emit = func(text string) {
 				markFirst()
 				req.OnDelta(text)
+			}
+			opts.OnDelta = func(text string) {
+				if out, ok := gate.allow(text); ok {
+					emit(out)
+				}
 			}
 		}
 		if req.OnThinking != nil {
@@ -402,6 +555,28 @@ func (g *Gateway) runTurn(ctx context.Context, req turnRequest) (*turnResult, er
 		}
 
 		result, err := g.client.Completion(ctx, opts)
+		// Text the gate was still buffering when the stream ended was never
+		// ambiguous after all — an answer that is just "5" matches the opening
+		// digits of the signature. Flush it before the verdict, or a short
+		// numeric answer would never reach the caller.
+		if err == nil && gate != nil {
+			if out, ok := gate.flush(); ok {
+				emit(out)
+			}
+		}
+		// MiniMax answers an exhausted balance with HTTP 200 and the failure
+		// inside the assistant content ("50110:insufficient balance (1008)").
+		// Only by reading that content can the failure be seen at all — left
+		// undetected it counts as a success and the pool keeps routing to a
+		// drained account.
+		if err == nil && (gate != nil && gate.hit || quotaDrainedText(result)) {
+			err = pool.ErrQuotaDrained
+		}
+		// The message endpoint can also answer a spent balance with a real
+		// HTTP 402; fold it into the same verdict as the 50110-in-content form.
+		if errors.Is(err, minimax.ErrInsufficientBalance) {
+			err = pool.ErrQuotaDrained
+		}
 		lease.Release(err)
 
 		lastErr = err
@@ -529,61 +704,56 @@ func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage) (stri
 	return strings.TrimSpace(builder.String()), images, nil
 }
 
-// resolveImage turns an OpenAI image reference into something the agent can
-// fetch on its own.
+// resolveImage turns an OpenAI image reference into the bytes to upload.
 //
-// Remote URLs pass through untouched. Inline data URIs are written into the
-// media directory and republished under Media.PublicBaseURL, because the agent
-// downloads attachments server-side and cannot dereference a data: URI. When no
-// public base URL is configured the request is rejected with an actionable
-// message rather than being forwarded to fail opaquely upstream.
+// Nothing is published or written to disk any more. The upstream stopped
+// fetching external URLs — an attachment must carry an object_key the account
+// owns — and the only way to get one is to upload the bytes. A remote URL is
+// therefore refused rather than fetched: fetching it would be the gateway
+// inventing a capability the upstream does not have, and it would put the
+// gateway behind an SSRF for no gain. A data URI is decoded here so a malformed
+// payload is a clear 400 rather than a failure mid-turn.
 func (g *Gateway) resolveImage(raw string) (minimax.UploadedImage, error) {
 	if !strings.HasPrefix(raw, "data:") {
-		return minimax.UploadedImage{URL: raw, Name: imageName(raw)}, nil
+		return minimax.UploadedImage{}, fmt.Errorf(
+			"remote image URLs are not supported: the upstream only accepts an image uploaded from the request, so send it inline as a data: URI")
 	}
 
 	index := strings.Index(raw, ",")
 	if index < 0 {
 		return minimax.UploadedImage{}, fmt.Errorf("invalid data URI")
 	}
+	mime := strings.TrimSpace(strings.TrimPrefix(strings.SplitN(raw[:index], ";", 2)[0], "data:"))
+	if mime == "" {
+		mime = "image/png"
+	}
 	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw[index+1:]))
 	if err != nil {
 		return minimax.UploadedImage{}, fmt.Errorf("invalid base64 image payload: %w", err)
 	}
-
-	settings := g.settings()
-	if strings.TrimSpace(settings.Media.PublicBaseURL) == "" {
-		return minimax.UploadedImage{}, fmt.Errorf("inline base64 images require the media public base URL to be configured; otherwise send a publicly reachable image URL")
-	}
-	if err := os.MkdirAll(settings.Media.GeneratedDir, 0o755); err != nil {
-		return minimax.UploadedImage{}, fmt.Errorf("prepare media directory: %w", err)
-	}
-
-	name := "inline_" + randomID(12) + ".png"
-	target := filepath.Join(settings.Media.GeneratedDir, name)
-	if err := os.WriteFile(target, decoded, 0o644); err != nil {
-		return minimax.UploadedImage{}, fmt.Errorf("store inline image: %w", err)
-	}
 	return minimax.UploadedImage{
-		URL:  strings.TrimRight(settings.Media.PublicBaseURL, "/") + "/" + name,
-		Name: name,
+		Data:     decoded,
+		FileName: "inline_" + randomID(8) + extensionForMime(mime),
+		MimeType: mime,
 	}, nil
 }
 
-// imageName derives a filename from a URL, falling back to a stable default.
-func imageName(raw string) string {
-	index := strings.LastIndex(raw, "/")
-	if index < 0 {
-		return "image.png"
+// extensionForMime keeps the uploaded file name honest. The upstream takes the
+// type from the attachment's mime_type, so this is cosmetic — but a .png name on
+// JPEG bytes is the kind of small lie that costs an afternoon later.
+func extensionForMime(mime string) string {
+	switch strings.ToLower(mime) {
+	case "image/jpeg", "image/jpg":
+		return ".jpg"
+	case "image/webp":
+		return ".webp"
+	case "image/gif":
+		return ".gif"
+	case "image/svg+xml":
+		return ".svg"
+	default:
+		return ".png"
 	}
-	candidate := raw[index+1:]
-	if query := strings.Index(candidate, "?"); query >= 0 {
-		candidate = candidate[:query]
-	}
-	if candidate == "" {
-		return "image.png"
-	}
-	return candidate
 }
 
 func parseContent(raw json.RawMessage) (string, []string) {
@@ -661,7 +831,7 @@ func (g *Gateway) runImageTurn(
 	)
 
 	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
-		lease, err := g.pool.Acquire(ctx, "")
+		lease, err := g.pool.Acquire(ctx, "", "")
 		if err != nil {
 			lastErr = err
 			break
@@ -1030,7 +1200,7 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 	)
 
 	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
-		lease, err := g.pool.Acquire(r.Context(), "")
+		lease, err := g.pool.Acquire(r.Context(), "", "")
 		if err != nil {
 			lastErr = err
 			break
@@ -1165,13 +1335,20 @@ func timeoutFor(settings config.Settings, model *store.ModelConfig) time.Duratio
 
 // Models implements GET /v1/models.
 func (g *Gateway) Models(w http.ResponseWriter, r *http.Request) {
-	if _, err := g.authenticate(r); err != nil {
+	key, err := g.authenticate(r)
+	if err != nil {
 		writeError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 	data := make([]any, 0, 4)
 	for _, model := range g.store.ListModels() {
-		if !model.Enabled {
+		// An unavailable entry is still in the catalogue so the console can
+		// show it struck through for one round, but it must not be advertised:
+		// the upstream would silently answer with a different model.
+		if !model.Enabled || model.Unavailable {
+			continue
+		}
+		if key.Pool == "gongyi" && model.ID != "minimax-m3" {
 			continue
 		}
 		data = append(data, map[string]any{"id": model.ID, "object": "model", "created": 0, "owned_by": "minimax"})
@@ -1181,13 +1358,14 @@ func (g *Gateway) Models(w http.ResponseWriter, r *http.Request) {
 
 // Health implements GET /health.
 func (g *Gateway) Health(w http.ResponseWriter, r *http.Request) {
-	total, active, cooldown, disabled, invalid, routable := g.pool.Summary()
+	total, active, cooldown, disabled, invalid, exhausted, routable := g.pool.Summary()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
 		"version": Version,
 		"pool": map[string]any{
 			"total": total, "active": active, "cooldown": cooldown,
-			"disabled": disabled, "invalid": invalid, "routable": routable,
+			"disabled": disabled, "invalid": invalid, "exhausted": exhausted,
+			"routable": routable,
 		},
 	})
 }

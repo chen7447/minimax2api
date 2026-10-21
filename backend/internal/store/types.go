@@ -12,6 +12,12 @@ const (
 	StatusCooldown = "cooldown"
 	StatusDisabled = "disabled"
 	StatusInvalid  = "invalid"
+	// StatusExhausted means the upstream refused the account for lack of
+	// balance (HTTP 402 or the 50110-in-content form). Unlike a transient
+	// cooldown it carries no recovery clock of its own: the account comes back
+	// when credits land (check-in payout or top-up), or when the exhausted
+	// sweep re-runs its check-in after ExhaustedRetryHours.
+	StatusExhausted = "exhausted"
 )
 
 // Account kinds.
@@ -94,6 +100,19 @@ type Credit struct {
 	SyncedAt  time.Time `json:"syncedAt"`
 }
 
+// CreditGrant is one batch of credits, as the upstream's credit/details
+// endpoint reports it. Check-in payouts, promotional drops and purchased
+// packs all land here as separate grants, each with its own expiry — which
+// is what the console's credit breakdown panel is built from.
+type CreditGrant struct {
+	GrantedAt time.Time `json:"grantedAt"`
+	ExpiresAt time.Time `json:"expiresAt"`
+	// Granted is the amount issued and Remaining what is left of it. A grant
+	// spent to zero is kept: it still shows where the credits came from.
+	Granted   float64 `json:"granted"`
+	Remaining float64 `json:"remaining"`
+}
+
 // Exhausted reports whether the balance is known to be spent.
 func (c *Credit) Exhausted() bool {
 	return c != nil && c.Total <= 0
@@ -104,8 +123,16 @@ type Account struct {
 	Name   string `json:"name"`
 	Kind   string `json:"kind"`
 	Region string `json:"region"`
-	// Token is the JWT lifted from the agent site's localStorage.
+	// Token is the JWT lifted from the agent site's localStorage. The renewal
+	// loop overwrites it in place with the fresh JWT from /user/renewal; the
+	// fingerprint fields below stay as they were — the renewed token works
+	// against the original fingerprint.
 	Token string `json:"token"`
+	// TokenRenewedAt is when the renewal loop last swapped this account's
+	// token, and TokenRenewExp the new token's expiry. Zero means never
+	// renewed (the token still carries its original exp).
+	TokenRenewedAt time.Time `json:"tokenRenewedAt,omitempty"`
+	TokenRenewExp  time.Time `json:"tokenRenewExp,omitempty"`
 	// UserID is the account's realUserID. The mainland deployment expects it
 	// alongside the token, and it doubles as a stable display identifier.
 	UserID string `json:"userId"`
@@ -123,25 +150,33 @@ type Account struct {
 	ScreenWidth  int    `json:"screenWidth"`
 	ScreenHeight int    `json:"screenHeight"`
 	// BaseURL optionally overrides the host for this account.
-	BaseURL       string    `json:"baseURL"`
-	Group         string    `json:"group"`
+	BaseURL string `json:"baseURL"`
+	Group   string `json:"group"`
+	// Gongyi marks an account dedicated to the public-welfare pool. Public keys
+	// only see marked accounts; personal keys never see them.
+	Gongyi        bool      `json:"gongyi,omitempty"`
 	Remark        string    `json:"remark"`
 	Enabled       bool      `json:"enabled"`
 	Priority      int       `json:"priority"`
 	MaxConcurrent int       `json:"maxConcurrent"`
 	Status        string    `json:"status"`
 	CooldownUntil time.Time `json:"cooldownUntil"`
-	FailCount     int       `json:"failCount"`
-	SuccessCount  int       `json:"successCount"`
-	LastUsedAt    time.Time `json:"lastUsedAt"`
-	LastError     string    `json:"lastError"`
-	CreatedAt     time.Time `json:"createdAt"`
-	UpdatedAt     time.Time `json:"updatedAt"`
-	Quota         *Quota    `json:"quota,omitempty"`
-	// SigninAt is the last check-in attempt, successful or not. It doubles as
-	// the scheduler's "already swept today" marker, which is why it is written
-	// even on failure: a day where every account errored must not be retried on
-	// every tick.
+	// ExhaustedAt anchors the exhausted sweep's per-account retry clock; zero
+	// while the account is not exhausted.
+	ExhaustedAt  time.Time `json:"exhaustedAt"`
+	FailCount    int       `json:"failCount"`
+	SuccessCount int       `json:"successCount"`
+	LastUsedAt   time.Time `json:"lastUsedAt"`
+	LastError    string    `json:"lastError"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+	Quota        *Quota    `json:"quota,omitempty"`
+	// SigninAt is the last check-in attempt, successful or not. Written even on
+	// failure: the console shows the outcome, and reconcile judges the payout by
+	// its timestamp. It is NOT the scheduler's "swept today" marker — the
+	// enqueue worker stamps it for fresh accounts at any hour, so it cannot
+	// distinguish "the pool was swept" from "one fresh account signed in". That
+	// judgement is State.SigninSweptAt's job.
 	SigninAt     time.Time    `json:"signinAt"`
 	SigninStatus string       `json:"signinStatus"`
 	SigninStreak int          `json:"signinStreak"`
@@ -153,6 +188,12 @@ type Account struct {
 	// and by the sweep. It is advisory: routing only acts on it while it is
 	// fresh (see Settings.CreditFresh).
 	Credit *Credit `json:"credit,omitempty"`
+	// Grants is the per-batch credit breakdown read alongside the balance.
+	// Populated by the same poller pass — one extra request per account per
+	// cycle — and kept on the account so the console's credit panel reads
+	// cached data instead of walking the whole pool on open.
+	Grants         []CreditGrant `json:"grants,omitempty"`
+	GrantsSyncedAt time.Time     `json:"grantsSyncedAt,omitempty"`
 }
 
 // AccountView is the API representation. It is an explicit projection rather
@@ -171,12 +212,14 @@ type AccountView struct {
 	ScreenHeight  int       `json:"screenHeight"`
 	BaseURL       string    `json:"baseURL"`
 	Group         string    `json:"group"`
+	Gongyi        bool      `json:"gongyi"`
 	Remark        string    `json:"remark"`
 	Enabled       bool      `json:"enabled"`
 	Priority      int       `json:"priority"`
 	MaxConcurrent int       `json:"maxConcurrent"`
 	Status        string    `json:"status"`
 	CooldownUntil time.Time `json:"cooldownUntil"`
+	ExhaustedAt   time.Time `json:"exhaustedAt"`
 	FailCount     int       `json:"failCount"`
 	SuccessCount  int       `json:"successCount"`
 	LastUsedAt    time.Time `json:"lastUsedAt"`
@@ -186,17 +229,24 @@ type AccountView struct {
 	// No omitempty: the console declares quota as a required field that may be
 	// null, so the key must always be present. Omitting it would make the
 	// property undefined instead of null and silently break strict checks.
-	Quota        *Quota       `json:"quota"`
-	SigninAt     time.Time    `json:"signinAt"`
-	SigninStatus string       `json:"signinStatus"`
-	SigninStreak int          `json:"signinStreak"`
-	SigninPoints int          `json:"signinPoints"`
-	SigninTotal  int64        `json:"signinTotal"`
-	SigninError  string       `json:"signinError"`
-	SigninPanel  *SigninPanel `json:"signinPanel"`
-	Credit       *Credit      `json:"credit"`
-	TokenMasked  string       `json:"tokenMasked"`
-	Inflight     int          `json:"inflight"`
+	Quota          *Quota        `json:"quota"`
+	SigninAt       time.Time     `json:"signinAt"`
+	SigninStatus   string        `json:"signinStatus"`
+	SigninStreak   int           `json:"signinStreak"`
+	SigninPoints   int           `json:"signinPoints"`
+	SigninTotal    int64         `json:"signinTotal"`
+	SigninError    string        `json:"signinError"`
+	SigninPanel    *SigninPanel  `json:"signinPanel"`
+	Credit         *Credit       `json:"credit"`
+	Grants         []CreditGrant `json:"grants"`
+	GrantsSyncedAt time.Time     `json:"grantsSyncedAt"`
+	// Token lifecycle: when the renewal loop last swapped the token and what
+	// the new expiry is. Zero on both means "never renewed" — the token still
+	// carries its original exp.
+	TokenRenewedAt time.Time `json:"tokenRenewedAt"`
+	TokenRenewExp  time.Time `json:"tokenRenewExp"`
+	TokenMasked    string    `json:"tokenMasked"`
+	Inflight       int       `json:"inflight"`
 }
 
 // NewAccountView projects an account for API responses.
@@ -206,10 +256,11 @@ func NewAccountView(account *Account, inflight int) AccountView {
 		UserID: account.UserID, Identifier: account.Identifier, AgentID: account.AgentID,
 		DeviceID: account.DeviceID, UUID: account.UUID,
 		ScreenWidth: account.ScreenWidth, ScreenHeight: account.ScreenHeight,
-		BaseURL: account.BaseURL, Group: account.Group, Remark: account.Remark,
+		BaseURL: account.BaseURL, Group: account.Group, Gongyi: account.Gongyi, Remark: account.Remark,
 		Enabled: account.Enabled, Priority: account.Priority,
 		MaxConcurrent: account.MaxConcurrent, Status: account.Status,
-		CooldownUntil: account.CooldownUntil, FailCount: account.FailCount,
+		CooldownUntil: account.CooldownUntil, ExhaustedAt: account.ExhaustedAt,
+		FailCount:    account.FailCount,
 		SuccessCount: account.SuccessCount, LastUsedAt: account.LastUsedAt,
 		LastError: account.LastError, CreatedAt: account.CreatedAt, UpdatedAt: account.UpdatedAt,
 		Quota: account.Quota, TokenMasked: MaskToken(account.Token), Inflight: inflight,
@@ -217,16 +268,20 @@ func NewAccountView(account *Account, inflight int) AccountView {
 		SigninStreak: account.SigninStreak, SigninPoints: account.SigninPoints,
 		SigninTotal: account.SigninTotal, SigninError: account.SigninError,
 		SigninPanel: account.SigninPanel, Credit: account.Credit,
+		Grants: account.Grants, GrantsSyncedAt: account.GrantsSyncedAt,
+		TokenRenewedAt: account.TokenRenewedAt, TokenRenewExp: account.TokenRenewExp,
 	}
 }
 
 type ClientKey struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	Key           string    `json:"key"`
-	Enabled       bool      `json:"enabled"`
-	RPMLimit      int       `json:"rpmLimit"`
-	MaxConcurrent int       `json:"maxConcurrent"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Key           string `json:"key"`
+	Enabled       bool   `json:"enabled"`
+	RPMLimit      int    `json:"rpmLimit"`
+	MaxConcurrent int    `json:"maxConcurrent"`
+	// Pool binds the key to an account pool: "" = personal, "gongyi" = public.
+	Pool          string    `json:"pool,omitempty"`
 	TotalRequests int64     `json:"totalRequests"`
 	CreatedAt     time.Time `json:"createdAt"`
 	LastUsedAt    time.Time `json:"lastUsedAt"`
@@ -264,9 +319,13 @@ type MediaItem struct {
 }
 
 type Admin struct {
-	Username     string `json:"username"`
-	PasswordHash string `json:"passwordHash"`
-	Salt         string `json:"salt"`
+	Username string `json:"username"`
+	// KeyHash is the PBKDF2 hash of the admin key. The JSON tag keeps its
+	// historical name so a state file written before the username/password pair
+	// became a single key still loads — losing it would silently re-seed a fresh
+	// admin on every restart.
+	KeyHash string `json:"passwordHash"`
+	Salt    string `json:"salt"`
 }
 
 type ModelConfig struct {
@@ -288,6 +347,30 @@ type ModelConfig struct {
 	Description   string `json:"description"`
 	Requests      int64  `json:"requests"`
 	Tokens        int64  `json:"tokens"`
+
+	// New marks an entry the most recent registry refresh added. It is cleared
+	// at the start of the next refresh, so the console can say "this is new"
+	// for exactly one round.
+	New bool `json:"new,omitempty"`
+
+	// Rank is the entry's 1-based position in the upstream's own model order
+	// (its picker's `model_order`), refreshed on every sync. 0 means the
+	// registry does not list the entry. The console sorts by it so the model the
+	// upstream currently leads with is at the top, without a release.
+	Rank int `json:"rank,omitempty"`
+
+	// Unavailable marks an entry the upstream no longer serves: a probe with its
+	// upstream id came back substituted with another model, or the endpoint
+	// rejected the id. Such an entry is kept for one round — the console shows
+	// it struck through at the bottom — and removed by the next refresh that
+	// still finds it unavailable. Requests naming it are refused rather than
+	// silently answered by the substitute.
+	Unavailable bool `json:"unavailable,omitempty"`
+
+	// Removed is the tombstone left behind by that second refresh. The entry
+	// stays in the state file (so MergeBuiltinModels cannot resurrect a built-in
+	// on the next boot) but is invisible to the console and the API.
+	Removed bool `json:"removed,omitempty"`
 }
 
 type State struct {
@@ -299,6 +382,16 @@ type State struct {
 	Audits     []*Audit        `json:"audits"`
 	Media      []*MediaItem    `json:"media"`
 	Models     []*ModelConfig  `json:"models"`
+	// SigninSweptAt is when the daily full-pool sweep last *completed*, and is
+	// the scheduler's authoritative "that day is served" marker.
+	//
+	// It is written once, after the walk finishes — not per account, and not at
+	// sweep start. Per-account stamps would let a mid-sweep crash claim the day
+	// was served; a start stamp would let it claim that while the walk is still
+	// running. Neither may happen: the day is only consumed by a sweep that
+	// actually walked the pool, so an interrupted sweep leaves the day unserved
+	// and the next tick (or the next boot) re-runs it.
+	SigninSweptAt time.Time `json:"signinSweptAt,omitempty"`
 }
 
 // BuiltinModels is the model catalogue exposed through /v1/models.
@@ -306,15 +399,20 @@ type State struct {
 // The chat entries all reach the same upstream agent; a conversation cannot be
 // routed to a different service by naming a different model. What an entry can
 // do since the upstream grew a model selector (the desktop client picks between
-// M3.1-Flash-Preview, M3, M2.7 and M2.7 HighSpeed) is *name* the model, and
-// that is what UpstreamModel carries: the id placed into the request's `model`
-// object. An entry without one — `minimax-agent`, `minimax-m3-thinking` — sends
-// no model field at all, exactly as every build before the selector did.
+// M3.1-Flash, M3, M2.7 and M2.7 HighSpeed) is *name* the model, and that is
+// what UpstreamModel carries: the id placed into the request's `model` object.
+// An entry without one — `minimax-agent`, `minimax-m3-thinking` — sends no
+// model field at all, exactly as every build before the selector did.
 //
-// The ids below are the ones the upstream's own config endpoint lists
-// (`MiniMax-M3`, `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`); M3.1 follows the
-// same pattern from its desktop label. The global model-field template can
-// still override or extend any of this; see buildMessageBody.
+// The ids below are the ones the upstream's own registry lists
+// (`GET /mavis/api/v1/models`): `MiniMax-M3` and `MiniMax-M3.1-Flash`, with
+// `MiniMax-M2.7` / `MiniMax-M2.7-highspeed` still in its whitelist. The list
+// changes without a release here — the registry is the authority, and the
+// console's "refresh from upstream" button is how a new id is adopted without
+// one. `minimax-m3.1-flash-preview` is the *old* name for M3.1-Flash and is
+// kept as an alias: the upstream still answers it, but it is no longer
+// advertised. The global model-field template can still override or extend any
+// of this; see buildMessageBody.
 //
 // The video entries are different in kind. MiniMax-H3 is not reachable as a
 // chat model at all — it is a plugin the agent calls server-side, selected by
@@ -328,10 +426,16 @@ func BuiltinModels() []*ModelConfig {
 			Enabled: true, Builtin: true, Description: "通用 Agent，自动规划并调用工具",
 		},
 		{
+			ID: "minimax-m3.1-flash", Name: "MiniMax M3.1 Flash", Upstream: "chat",
+			UpstreamModel: "MiniMax-M3.1-Flash", Type: ModelTypeChat,
+			Enabled: true, Builtin: true, New: true,
+			Description: "当前一代对话模型；上游 2026-10 由 Preview 转正",
+		},
+		{
 			ID: "minimax-m3.1-flash-preview", Name: "MiniMax M3.1 Flash Preview", Upstream: "chat",
 			UpstreamModel: "MiniMax-M3.1-Flash-Preview", Type: ModelTypeChat,
 			Enabled: true, Builtin: true,
-			Description: "桌面端新增的预览版；上游按账号默认模型回答",
+			Description: "旧名称，上游已改名为 M3.1 Flash；保留作兼容别名",
 		},
 		{
 			ID: "minimax-m3", Name: "MiniMax M3", Upstream: "chat", UpstreamModel: "MiniMax-M3", Type: ModelTypeChat,
@@ -385,13 +489,15 @@ func BuiltinModels() []*ModelConfig {
 // be replaced.
 //
 // Entries already present are left exactly as stored. Only the *existence* of a
-// built-in is enforced, never its state — with one deliberate exception: an
-// upstream model id the stored copy is missing is adopted from the built-in.
-// There is no console and no API that sets UpstreamModel, so an empty value on
-// a built-in entry can never be the operator's intent; it is always the freeze
-// of a default from before that entry carried an id. The same argument repairs
-// settings in Normalize, and it applies with more force here: the field is not
-// reachable by any other route at all.
+// built-in is enforced, never its state — with two deliberate exceptions: an
+// upstream model id the stored copy is missing is adopted from the built-in, and
+// a built-in that declares itself `New` is adopted as new by an install that
+// already stored it. There is no console and no API that sets UpstreamModel, so
+// an empty value on a built-in entry can never be the operator's intent; it is
+// always the freeze of a default from before that entry carried an id. The same
+// argument applies to the badge: an install that stored the entry before the
+// badge existed would otherwise never show it. The adoption is self-limiting —
+// once a refresh ranks the entry (Rank > 0), the badge is no longer re-applied.
 func MergeBuiltinModels(models []*ModelConfig) ([]*ModelConfig, bool) {
 	builtinByID := make(map[string]*ModelConfig)
 	for _, builtin := range BuiltinModels() {
@@ -409,11 +515,17 @@ func MergeBuiltinModels(models []*ModelConfig) ([]*ModelConfig, bool) {
 			continue
 		}
 		builtin, ok := builtinByID[model.ID]
-		if !ok || builtin.UpstreamModel == "" || model.UpstreamModel != "" {
+		if !ok {
 			continue
 		}
-		model.UpstreamModel = builtin.UpstreamModel
-		changed = true
+		if builtin.UpstreamModel != "" && model.UpstreamModel == "" {
+			model.UpstreamModel = builtin.UpstreamModel
+			changed = true
+		}
+		if builtin.New && !model.New && model.Rank == 0 && !model.Removed {
+			model.New = true
+			changed = true
+		}
 	}
 	for _, builtin := range BuiltinModels() {
 		if _, ok := known[builtin.ID]; ok {

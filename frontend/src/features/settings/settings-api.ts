@@ -13,12 +13,19 @@ export type SettingsDTO = {
     agentID: string;
     sessionPath: string;
     messagePath: string;
+    /** "agent" drives the agent conversation endpoint; "direct" drives the model
+     * endpoint the official client uses. Only "direct" supports tool calls
+     * natively, which is what a coding agent needs. */
+    mode: "agent" | "direct";
+    modelPath: string;
+    modelsPath: string;
     userInfoPath: string;
     agentListPath: string;
     configPath: string;
     connectionsPath: string;
     summariesPath: string;
     driveFilePath: string;
+    uploadsPath: string;
     modelPayload: string;
     language: string;
     screenWidth: number;
@@ -36,6 +43,8 @@ export type SettingsDTO = {
     capacityWaitSec: number;
     stickyTTLSec: number;
     preferIdle: boolean;
+    activePoolSize: number;
+    exhaustedRetryHours: number;
   };
   audit: {
     retentionDays: number;
@@ -51,8 +60,11 @@ export type SettingsDTO = {
   };
   signin: {
     enabled: boolean;
+    /** Legacy fixed slot, superseded by the randomized daily slot. Read-only
+     * here: round-tripped so a save cannot blank it server-side. */
     hour: number;
     minute: number;
+    slotSeed: string;
     gapSeconds: number;
     timeoutSec: number;
     skipZeroCredit: boolean;
@@ -91,6 +103,6 @@ export function getSettings(): Promise<SettingsDTO> {
   return apiRequest<SettingsDTO>("/admin/api/settings");
 }
 
-export function saveSettings(payload: Partial<SettingsDTO> & { adminPassword?: string }): Promise<SettingsDTO> {
+export function saveSettings(payload: Partial<SettingsDTO> & { adminKey?: string }): Promise<SettingsDTO> {
   return apiRequest("/admin/api/settings", { method: "PUT", body: payload });
 }

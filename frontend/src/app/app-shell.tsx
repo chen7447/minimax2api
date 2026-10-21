@@ -1,4 +1,4 @@
-import { ChevronDown, Eye, Image, KeyRound, LayoutDashboard, LogOut, Menu, Monitor, Moon, MoreHorizontal, Settings, Sparkles, Sun, Users, Languages, Box, Activity } from "lucide-react";
+import { ChevronDown, Eye, Heart, Image, KeyRound, LayoutDashboard, LogOut, Menu, Monitor, Moon, MoreHorizontal, Settings, Sparkles, Sun, Users, Languages, Box, Activity, Coins } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
@@ -17,6 +17,8 @@ import { cn } from "@/shared/lib/cn";
 const navigation = [
   { href: "/dashboard", label: "nav.dashboard", icon: LayoutDashboard },
   { href: "/accounts", label: "nav.accounts", icon: Users },
+  { href: "/gongyi", label: "nav.gongyi", icon: Heart },
+  { href: "/credits", label: "nav.credits", icon: Coins },
   { href: "/client-keys", label: "nav.clientKeys", icon: KeyRound },
   { href: "/models", label: "nav.models", icon: Box },
   { href: "/gallery", label: "nav.gallery", icon: Image },
@@ -46,35 +48,35 @@ const documentation = [
 
 export function AppShell() {
   const { t, i18n } = useTranslation();
-  const { admin, logout, changePassword } = useAuth();
+  const { admin, logout, changeKey } = useAuth();
   const { setTheme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
-  const [passwordOpen, setPasswordOpen] = useState(false);
-  const [passwordBusy, setPasswordBusy] = useState(false);
-  const [currentPassword, setCurrentPassword] = useState("");
-  const [newPassword, setNewPassword] = useState("");
+  const [keyOpen, setKeyOpen] = useState(false);
+  const [keyBusy, setKeyBusy] = useState(false);
+  const [currentKey, setCurrentKey] = useState("");
+  const [newKey, setNewKey] = useState("");
   const [documentationOpen, setDocumentationOpen] = useState<Record<string, boolean>>({ Chat: true });
 
-  async function submitPassword(): Promise<void> {
-    if (!currentPassword) {
-      toast.error(t("auth.passwordRequired"));
+  async function submitKey(): Promise<void> {
+    if (!currentKey) {
+      toast.error(t("auth.keyRequired"));
       return;
     }
-    if (newPassword.length < 8) {
+    if (newKey.length < 8) {
       toast.error(t("errors.required"));
       return;
     }
-    setPasswordBusy(true);
+    setKeyBusy(true);
     try {
-      await changePassword(currentPassword, newPassword);
-      toast.success(t("auth.passwordUpdated"));
-      setPasswordOpen(false);
-      setCurrentPassword("");
-      setNewPassword("");
+      await changeKey(currentKey, newKey);
+      toast.success(t("auth.keyUpdated"));
+      setKeyOpen(false);
+      setCurrentKey("");
+      setNewKey("");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : t("errors.generic"));
     } finally {
-      setPasswordBusy(false);
+      setKeyBusy(false);
     }
   }
 
@@ -208,9 +210,9 @@ export function AppShell() {
             English
           </DropdownMenuItem>
           <DropdownMenuSeparator />
-          <DropdownMenuItem className="h-8" onClick={() => setPasswordOpen(true)}>
+          <DropdownMenuItem className="h-8" onClick={() => setKeyOpen(true)}>
             <KeyRound />
-            {t("auth.changePassword")}
+            {t("auth.changeKey")}
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem className="h-8" onClick={() => void logout()}>
@@ -280,39 +282,39 @@ export function AppShell() {
         <SiteFooter />
       </div>
 
-      <Dialog open={passwordOpen} onOpenChange={setPasswordOpen}>
+      <Dialog open={keyOpen} onOpenChange={setKeyOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{t("auth.changePassword")}</DialogTitle>
+            <DialogTitle>{t("auth.changeKey")}</DialogTitle>
             <DialogDescription>{admin?.username}</DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="current-password">{t("auth.currentPassword")}</Label>
+              <Label htmlFor="current-key">{t("auth.currentKey")}</Label>
               <Input
-                id="current-password"
+                id="current-key"
                 type="password"
                 autoComplete="current-password"
-                value={currentPassword}
-                onChange={(event) => setCurrentPassword(event.target.value)}
+                value={currentKey}
+                onChange={(event) => setCurrentKey(event.target.value)}
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="new-password">{t("auth.newPassword")}</Label>
+              <Label htmlFor="new-key">{t("auth.newKey")}</Label>
               <Input
-                id="new-password"
+                id="new-key"
                 type="password"
                 autoComplete="new-password"
-                value={newPassword}
-                onChange={(event) => setNewPassword(event.target.value)}
+                value={newKey}
+                onChange={(event) => setNewKey(event.target.value)}
               />
             </div>
           </div>
           <DialogFooter>
-            <Button variant="secondary" size="sm" onClick={() => setPasswordOpen(false)}>
+            <Button variant="secondary" size="sm" onClick={() => setKeyOpen(false)}>
               {t("common.cancel")}
             </Button>
-            <Button size="sm" disabled={passwordBusy} onClick={() => void submitPassword()}>
+            <Button size="sm" disabled={keyBusy} onClick={() => void submitKey()}>
               {t("common.save")}
             </Button>
           </DialogFooter>

@@ -6,6 +6,8 @@ import {
   Coins,
   Download,
   FileUp,
+  Globe,
+  KeyRound,
   Pencil,
   Plus,
   RefreshCw,
@@ -18,7 +20,7 @@ import {
   Power,
   PowerOff,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -70,6 +72,8 @@ import {
   refreshAllQuota,
   refreshCredit,
   refreshQuota,
+  renewAccount,
+  runRenewAll,
   runSignin,
   signinAccount,
   updateAccount,
@@ -79,6 +83,7 @@ import {
   type AccountSummary,
 } from "@/features/accounts/accounts-api";
 import { AccountNameCell, AccountRoutingCell, AccountStatusCell } from "@/features/accounts/account-name-cell";
+import { CaptureDialog } from "@/features/accounts/capture-dialog";
 import { AccountQuotaCell } from "@/features/accounts/account-quota";
 import { AccountCreditCell, AccountSigninCell } from "@/features/accounts/account-signin";
 import { DataTableShell } from "@/shared/components/data-table-shell";
@@ -176,6 +181,7 @@ export function AccountsPage() {
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState("");
   const [importRegion, setImportRegion] = useState<AccountRegionInput>("auto");
+  const [captureOpen, setCaptureOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [exportLimit, setExportLimit] = useState(10000);
   const [cleanupOpen, setCleanupOpen] = useState(false);
@@ -202,11 +208,13 @@ export function AccountsPage() {
   const groupsQuery = useQuery({ queryKey: ["account-groups"], queryFn: listAccountGroups });
 
   // Scheduler state, shown in the toolbar so the operator can see when the next
-  // automatic sweep lands without opening the settings page.
+  // automatic sweep lands without opening the settings page. Polls faster while
+  // a sweep is in flight, so the "checking in" button state and the eventual
+  // report both show up promptly.
   const signinQuery = useQuery({
     queryKey: ["signin"],
     queryFn: getSigninOverview,
-    refetchInterval: 60_000,
+    refetchInterval: (query) => (query.state.data?.running ? 5_000 : 60_000),
   });
   const signinEnabled = signinQuery.data?.enabled ?? false;
   const skipZeroCredit = signinQuery.data?.skipZeroCredit ?? false;
@@ -218,6 +226,7 @@ export function AccountsPage() {
     cooldown: 0,
     disabled: 0,
     invalid: 0,
+    exhausted: 0,
     routable: 0,
   };
   const total = accountsQuery.data?.total ?? 0;
@@ -378,17 +387,30 @@ export function AccountsPage() {
 
   const signinAllMutation = useMutation({
     mutationFn: () => runSignin(),
-    onSuccess: ({ report }) => {
-      toast.success(
-        t("accounts.signinAllDone", {
-          claimed: report.claimed,
-          already: report.already,
-          failed: report.failed,
-          skipped: report.skipped,
-        }),
-      );
+    onSuccess: ({ total }) => {
+      // The sweep now runs server-side, so this is a start notice rather than
+      // an outcome; the outcome arrives through the overview poll below.
+      toast.info(t("accounts.signinStarted", { total }));
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
+  const renewOneMutation = useMutation({
+    mutationFn: (id: string) => renewAccount(id),
+    onSuccess: ({ expiresAt }) => {
+      toast.success(t("accounts.renewDone", { time: formatDateTime(expiresAt, i18n.language) }));
       invalidate();
-      void signinQuery.refetch();
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
+  const renewAllMutation = useMutation({
+    mutationFn: () => runRenewAll(),
+    onSuccess: () => {
+      // The pass renews only tokens inside the expiry window, so it is usually
+      // seconds; the per-account stamps (tokenRenewedAt) show up through the
+      // ordinary accounts poll.
+      toast.info(t("accounts.renewStarted"));
     },
     onError: (error) => toast.error(errorMessage(error)),
   });
@@ -401,6 +423,35 @@ export function AccountsPage() {
     },
     onError: (error) => toast.error(errorMessage(error)),
   });
+
+  const signinRunning = signinQuery.data?.running ?? false;
+
+  // Announces a finished sweep. The report lands on the overview poll rather
+  // than on the click, so this watches for lastReport to change while nothing
+  // is running. The first report seen on page load is recorded silently —
+  // otherwise every visit would replay the last run's toast.
+  const announcedReport = useRef<string | null>(null);
+  useEffect(() => {
+    if (signinRunning) return;
+    const report = signinQuery.data?.lastReport;
+    if (!report) return;
+    if (announcedReport.current === null) {
+      announcedReport.current = report.endedAt;
+      return;
+    }
+    if (report.endedAt === announcedReport.current) return;
+    announcedReport.current = report.endedAt;
+    toast.success(
+      t("accounts.signinAllDone", {
+        claimed: report.claimed,
+        already: report.already,
+        failed: report.failed,
+        skipped: report.skipped,
+      }),
+    );
+    invalidate();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- guarded by the endedAt comparison, so extra runs are no-ops
+  }, [signinRunning, signinQuery.data]);
 
   const busy =
     batchMutation.isPending ||
@@ -518,6 +569,10 @@ export function AccountsPage() {
                   <SquareTerminal />
                   {t("accounts.tokenLogin")}
                 </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setCaptureOpen(true)}>
+                  <Globe />
+                  {t("accounts.captureTitle")}
+                </DropdownMenuItem>
                 <DropdownMenuItem onClick={() => setImportOpen(true)}>
                   <FileUp />
                   {t("accounts.quickImport")}
@@ -563,10 +618,11 @@ export function AccountsPage() {
           icon={<ShieldAlert />}
           loading={accountsQuery.isPending}
           label={t("accounts.abnormalAccountCount")}
-          value={formatNumber(summary.invalid + summary.disabled)}
+          value={formatNumber(summary.invalid + summary.disabled + summary.exhausted)}
           detail={t("accounts.abnormalBreakdown", {
             invalid: formatNumber(summary.invalid),
             disabled: formatNumber(summary.disabled),
+            exhausted: formatNumber(summary.exhausted),
           })}
         />
       </section>
@@ -600,6 +656,7 @@ export function AccountsPage() {
                   { value: "", label: t("accounts.allStatus") },
                   { value: "active", label: t("accounts.statusActive") },
                   { value: "cooldown", label: t("accounts.statusCooldown") },
+                  { value: "exhausted", label: t("accounts.statusExhausted") },
                   { value: "disabled", label: t("accounts.statusDisabled") },
                   { value: "invalid", label: t("accounts.statusInvalid") },
                 ]}
@@ -685,9 +742,23 @@ export function AccountsPage() {
                 </>
               ) : (
                 <>
-                  <Button variant="secondary" size="sm" disabled={busy} onClick={() => signinAllMutation.mutate()}>
-                    <CalendarCheck />
-                    {t("accounts.signinAll")}
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={busy || signinRunning}
+                    onClick={() => signinAllMutation.mutate()}
+                  >
+                    {signinRunning ? <Spinner className="size-3.5" /> : <CalendarCheck />}
+                    {signinRunning ? t("accounts.signinRunning") : t("accounts.signinAll")}
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={busy || renewAllMutation.isPending}
+                    onClick={() => renewAllMutation.mutate()}
+                  >
+                    <KeyRound />
+                    {t("accounts.renewAll")}
                   </Button>
                   <Button variant="secondary" size="sm" disabled={busy} onClick={() => quotaAllMutation.mutate()}>
                     <RefreshCw />
@@ -746,6 +817,7 @@ export function AccountsPage() {
               onQuota={(id) => quotaMutation.mutate(id)}
               onSignin={(id) => signinOneMutation.mutate(id)}
               onCredit={(id) => creditMutation.mutate(id)}
+              onRenew={(id) => renewOneMutation.mutate(id)}
               onClearCooldown={(id) => batchMutation.mutate({ action: "clearCooldown", ids: [id] })}
               onToggleEnabled={(account) =>
                 updateMutation.mutate({
@@ -965,6 +1037,8 @@ export function AccountsPage() {
         </DialogContent>
       </Dialog>
 
+      <CaptureDialog open={captureOpen} onOpenChange={setCaptureOpen} onCaptured={() => invalidate()} />
+
       <Dialog open={importOpen} onOpenChange={setImportOpen}>
         <DialogContent className="max-w-xl">
           <DialogHeader>
@@ -1054,6 +1128,7 @@ export function AccountsPage() {
               { value: "invalid", label: t("accounts.statusInvalid") },
               { value: "disabled", label: t("accounts.statusDisabled") },
               { value: "cooldown", label: t("accounts.statusCooldown") },
+              { value: "exhausted", label: t("accounts.statusExhausted") },
             ].map((option) => (
               <label key={option.value} className="flex items-center gap-2 text-xs">
                 <Checkbox
@@ -1208,6 +1283,7 @@ function AccountsTable({
   onQuota,
   onSignin,
   onCredit,
+  onRenew,
   onClearCooldown,
   onToggleEnabled,
   onDelete,
@@ -1224,6 +1300,7 @@ function AccountsTable({
   onQuota: (id: string) => void;
   onSignin: (id: string) => void;
   onCredit: (id: string) => void;
+  onRenew: (id: string) => void;
   onClearCooldown: (id: string) => void;
   onToggleEnabled: (account: AccountDTO) => void;
   onDelete: (account: AccountDTO) => void;
@@ -1324,6 +1401,10 @@ function AccountsTable({
                     <Coins />
                     {t("accounts.refreshCredit")}
                   </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onRenew(account.id)}>
+                    <KeyRound />
+                    {t("accounts.renewOne")}
+                  </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => onQuota(account.id)}>
                     <RefreshCw />
                     {t("accounts.refreshQuota")}
@@ -1336,6 +1417,14 @@ function AccountsTable({
                     <TimerOff />
                     {t("accounts.clearCooldown")}
                   </DropdownMenuItem>
+                  {/* A drained account carries no recovery clock, so the same
+                      revive path gets its own explicit entry. */}
+                  {account.status === "exhausted" ? (
+                    <DropdownMenuItem onClick={() => onClearCooldown(account.id)}>
+                      <Power />
+                      {t("accounts.activate")}
+                    </DropdownMenuItem>
+                  ) : null}
                   <DropdownMenuSeparator />
                   <DropdownMenuItem onClick={() => onToggleEnabled(account)}>
                     {account.enabled ? <PowerOff /> : <Power />}

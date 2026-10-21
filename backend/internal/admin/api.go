@@ -7,10 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"minimax2api/internal/config"
@@ -28,11 +31,31 @@ type API struct {
 	client   *minimax.Client
 	signin   *signin.Service
 	settings func() config.Settings
+	capture  *captureHub
 	started  time.Time
+
+	// Public-welfare pool: config/meter/push history live in data/gongyi.json.
+	gongyi              *gongyiState
+	gongyiPushMu        sync.Mutex
+	gongyiLastPushAt    time.Time
+	gongyiRefreshMu     sync.Mutex
+	gongyiLastRefreshAt time.Time
+	gongyiRefreshing    bool
+	gongyiOnlineMu      sync.Mutex
+	gongyiOnlineAt      time.Time
+	gongyiOnlineV       map[string]any
+
+	loginLimiter *loginLimiter
 }
 
 func New(st *store.Store, p *pool.Pool, client *minimax.Client, signinSvc *signin.Service, settings func() config.Settings) *API {
-	return &API{store: st, pool: p, client: client, signin: signinSvc, settings: settings, started: time.Now()}
+	api := &API{
+		store: st, pool: p, client: client, signin: signinSvc,
+		settings: settings, capture: newCaptureHub(), started: time.Now(),
+		loginLimiter: newLoginLimiter(),
+	}
+	api.gongyi = loadGongyiState(filepath.Join(st.DataDir(), "gongyi.json"))
+	return api
 }
 
 // Register installs every admin route on the mux.
@@ -40,7 +63,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/api/auth/login", a.login)
 	mux.HandleFunc("GET /admin/api/auth/me", a.guard(a.me))
 	mux.HandleFunc("POST /admin/api/auth/logout", a.guard(a.logout))
-	mux.HandleFunc("POST /admin/api/auth/password", a.guard(a.changePassword))
+	mux.HandleFunc("POST /admin/api/auth/key", a.guard(a.changeKey))
 
 	mux.HandleFunc("GET /admin/api/dashboard", a.guard(a.dashboard))
 
@@ -59,9 +82,34 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/api/accounts/{id}/quota", a.guard(a.refreshQuota))
 	mux.HandleFunc("POST /admin/api/accounts/{id}/signin", a.guard(a.signinAccount))
 	mux.HandleFunc("POST /admin/api/accounts/{id}/credit", a.guard(a.refreshCredit))
+	mux.HandleFunc("POST /admin/api/accounts/{id}/grants", a.guard(a.refreshGrants))
+	mux.HandleFunc("GET /admin/api/credits", a.guard(a.creditBreakdown))
+	mux.HandleFunc("POST /admin/api/accounts/{id}/activate", a.guard(a.activateAccount))
+
+	// Public-welfare pool (translate.7447.site, pool B).
+	mux.HandleFunc("GET /admin/api/gongyi/overview", a.guard(a.adminGongyiOverview))
+	mux.HandleFunc("GET /admin/api/gongyi/accounts", a.guard(a.adminGongyiAccounts))
+	mux.HandleFunc("POST /admin/api/gongyi/select", a.guard(a.adminGongyiSelect))
+	mux.HandleFunc("POST /admin/api/gongyi/accounts/{id}", a.guard(a.adminGongyiToggle))
+	mux.HandleFunc("POST /admin/api/gongyi/refresh", a.guard(a.adminGongyiRefresh))
+	mux.HandleFunc("POST /admin/api/gongyi/push", a.guard(a.adminGongyiPush))
+	mux.HandleFunc("POST /admin/api/gongyi/self_check", a.guard(a.adminGongyiSelfCheck))
+	mux.HandleFunc("GET /admin/api/gongyi/usage", a.guard(a.adminGongyiUsage))
+	mux.HandleFunc("GET /admin/api/gongyi/config", a.guard(a.adminGongyiConfigGet))
+	mux.HandleFunc("POST /admin/api/gongyi/config", a.guard(a.adminGongyiConfigSave))
+
+	// Credential capture: the console publishes a request, a helper on the
+	// operator's machine drives a browser and posts the credential back.
+	mux.HandleFunc("POST /admin/api/capture", a.guard(a.startCapture))
+	mux.HandleFunc("GET /admin/api/capture", a.guard(a.getCapture))
+	mux.HandleFunc("GET /admin/api/capture/pending", a.guard(a.capturePending))
+	mux.HandleFunc("POST /admin/api/capture/{id}/cancel", a.guard(a.cancelCapture))
+	mux.HandleFunc("POST /admin/api/capture/{id}/credential", a.guard(a.captureCredential))
 
 	mux.HandleFunc("GET /admin/api/signin", a.guard(a.signinOverview))
 	mux.HandleFunc("POST /admin/api/signin/run", a.guard(a.signinRun))
+	mux.HandleFunc("POST /admin/api/renew/run", a.guard(a.renewRun))
+	mux.HandleFunc("POST /admin/api/accounts/{id}/renew", a.guard(a.renewAccount))
 
 	mux.HandleFunc("GET /admin/api/client-keys", a.guard(a.listClientKeys))
 	mux.HandleFunc("POST /admin/api/client-keys", a.guard(a.createClientKey))
@@ -69,6 +117,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /admin/api/client-keys/{id}", a.guard(a.deleteClientKey))
 
 	mux.HandleFunc("GET /admin/api/models", a.guard(a.listModels))
+	mux.HandleFunc("POST /admin/api/models/refresh", a.guard(a.refreshModels))
 	mux.HandleFunc("PATCH /admin/api/models/{id}", a.guard(a.updateModel))
 
 	mux.HandleFunc("GET /admin/api/audits", a.guard(a.listAudits))
@@ -89,8 +138,12 @@ const sessionKey ctxKey = "session"
 
 func (a *API) guard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Either a session token (what the console uses after signing in) or the
+		// admin key itself, accepted directly so a script can call the admin API
+		// without a login round-trip. The session lookup runs first on purpose:
+		// it is a map hit, while the key check pays the PBKDF2 cost.
 		token := bearer(r)
-		if token == "" || !a.store.ValidateSession(token) {
+		if token == "" || (!a.store.ValidateSession(token) && !a.store.VerifyKey(token)) {
 			writeError(w, http.StatusUnauthorized, "登录已过期，请重新登录")
 			return
 		}
@@ -109,24 +162,27 @@ func bearer(r *http.Request) string {
 // --------------------------------------------------------------------- auth
 
 type loginRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Key string `json:"key"`
 }
 
 func (a *API) login(w http.ResponseWriter, r *http.Request) {
+	if !a.loginLimiter.allow(loginClientIP(r)) {
+		writeError(w, http.StatusTooManyRequests, "尝试过于频繁，请稍后再试")
+		return
+	}
 	var request loginRequest
 	if err := decode(r, &request); err != nil {
 		writeError(w, http.StatusBadRequest, "请求格式错误")
 		return
 	}
-	if !a.store.VerifyPassword(strings.TrimSpace(request.Username), request.Password) {
-		writeError(w, http.StatusUnauthorized, "用户名或密码错误")
+	if !a.store.VerifyKey(strings.TrimSpace(request.Key)) {
+		writeError(w, http.StatusUnauthorized, "密钥不正确")
 		return
 	}
 	token, _ := a.store.IssueSession()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token":    token,
-		"username": request.Username,
+		"username": a.store.AdminProfile().Username,
 		"role":     "admin",
 	})
 }
@@ -141,21 +197,20 @@ func (a *API) logout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (a *API) changePassword(w http.ResponseWriter, r *http.Request) {
+func (a *API) changeKey(w http.ResponseWriter, r *http.Request) {
 	var request struct {
-		CurrentPassword string `json:"currentPassword"`
-		NewPassword     string `json:"newPassword"`
+		CurrentKey string `json:"currentKey"`
+		NewKey     string `json:"newKey"`
 	}
 	if err := decode(r, &request); err != nil {
 		writeError(w, http.StatusBadRequest, "请求格式错误")
 		return
 	}
-	admin := a.store.AdminProfile()
-	if !a.store.VerifyPassword(admin.Username, request.CurrentPassword) {
-		writeError(w, http.StatusBadRequest, "当前密码不正确")
+	if !a.store.VerifyKey(request.CurrentKey) {
+		writeError(w, http.StatusBadRequest, "当前密钥不正确")
 		return
 	}
-	if err := a.store.SetPassword(admin.Username, request.NewPassword); err != nil {
+	if err := a.store.SetKey(request.NewKey); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -275,7 +330,7 @@ func (a *API) dashboard(w http.ResponseWriter, r *http.Request) {
 	// not the same as active: an account whose cooldown has already elapsed is
 	// still labelled cooldown but is perfectly schedulable, and reporting only
 	// the status count made a healthy pool look dead.
-	_, active, cooldown, disabled, invalid, routable := a.pool.Summary()
+	_, active, cooldown, disabled, invalid, exhausted, routable := a.pool.Summary()
 	enabledModels := 0
 	for _, model := range models {
 		if model.Enabled {
@@ -347,16 +402,17 @@ func (a *API) dashboard(w http.ResponseWriter, r *http.Request) {
 			"estimatedCostUsd":             0,
 		},
 		"resources": map[string]any{
-			"totalAccounts":    len(accounts),
-			"activeAccounts":   active,
-			"routableAccounts": routable,
-			"cooldownAccounts": cooldown,
-			"disabledAccounts": disabled,
-			"invalidAccounts":  invalid,
-			"totalModels":      len(models),
-			"enabledModels":    enabledModels,
-			"totalClientKeys":  len(keys),
-			"activeClientKeys": activeKeys,
+			"totalAccounts":     len(accounts),
+			"activeAccounts":    active,
+			"routableAccounts":  routable,
+			"cooldownAccounts":  cooldown,
+			"disabledAccounts":  disabled,
+			"invalidAccounts":   invalid,
+			"exhaustedAccounts": exhausted,
+			"totalModels":       len(models),
+			"enabledModels":     enabledModels,
+			"totalClientKeys":   len(keys),
+			"activeClientKeys":  activeKeys,
 		},
 		"trend":        trend,
 		"topModels":    topModels,
@@ -441,7 +497,7 @@ func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
 		end = total
 	}
 
-	_, active, cooldown, disabled, invalid, routable := a.pool.Summary()
+	_, active, cooldown, disabled, invalid, exhausted, routable := a.pool.Summary()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items":    views[start:end],
 		"total":    total,
@@ -449,7 +505,8 @@ func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
 		"pageSize": pageSize,
 		"summary": map[string]any{
 			"total": total, "active": active, "cooldown": cooldown,
-			"disabled": disabled, "invalid": invalid, "routable": routable,
+			"disabled": disabled, "invalid": invalid, "exhausted": exhausted,
+			"routable": routable,
 		},
 	})
 }
@@ -498,6 +555,7 @@ type accountPayload struct {
 	ScreenHeight  int    `json:"screenHeight"`
 	BaseURL       string `json:"baseURL"`
 	Group         string `json:"group"`
+	Gongyi        *bool  `json:"gongyi"`
 	Remark        string `json:"remark"`
 	Priority      int    `json:"priority"`
 	MaxConcurrent int    `json:"maxConcurrent"`
@@ -529,6 +587,9 @@ func (a *API) createAccount(w http.ResponseWriter, r *http.Request) {
 	// The probe talks to the upstream and can take a while, so the account is
 	// returned immediately and the probe continues in background.
 	go a.syncQuotaDetached(account.ID)
+	// A manually added account must not wait for tomorrow's sweep to see its
+	// first check-in; the queue worker spaces it out like any other.
+	a.signin.Enqueue(account.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"account": a.view(account.ID)})
 }
 
@@ -747,6 +808,9 @@ func (a *API) updateAccount(w http.ResponseWriter, r *http.Request) {
 		// three "empty" is a meaningful value the operator may want to set.
 		account.BaseURL = strings.TrimSpace(payload.BaseURL)
 		account.Group = strings.TrimSpace(payload.Group)
+		if payload.Gongyi != nil {
+			account.Gongyi = *payload.Gongyi
+		}
 		account.Remark = strings.TrimSpace(payload.Remark)
 		if payload.Priority > 0 {
 			account.Priority = clampInt(payload.Priority, 1, 100)
@@ -815,6 +879,7 @@ func (a *API) batchAccounts(w http.ResponseWriter, r *http.Request) {
 		updated, err := a.store.UpdateAccounts(payload.IDs, func(account *store.Account) {
 			account.Status = store.StatusActive
 			account.CooldownUntil = time.Time{}
+			account.ExhaustedAt = time.Time{}
 			account.FailCount = 0
 			account.LastError = ""
 		})
@@ -933,6 +998,10 @@ func (a *API) importAccounts(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			updated++
+			// The refreshed token may belong to an account that has not been
+			// served today; asking for a check-in costs at most one status read
+			// when it already has been.
+			a.signin.Enqueue(existing.ID)
 			continue
 		}
 
@@ -941,6 +1010,7 @@ func (a *API) importAccounts(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		created++
+		a.signin.Enqueue(account.ID)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -1419,6 +1489,10 @@ func (a *API) signinOverview(w http.ResponseWriter, r *http.Request) {
 		"nextRunAt":  a.signin.NextRun(now),
 		"lastRunAt":  a.signin.LastRunAt(),
 		"lastReport": last,
+		// The randomized slot is anchored to the Beijing day; the console shows
+		// it as a local wall-clock time so the operator can see when today's
+		// sweep is due without doing the timezone math.
+		"slotRandomized": true,
 		// The console needs this to know whether a zero balance is actually
 		// holding the account out of rotation, or merely being displayed.
 		"skipZeroCredit": settings.Signin.SkipZeroCredit,
@@ -1430,16 +1504,63 @@ func (a *API) signinOverview(w http.ResponseWriter, r *http.Request) {
 }
 
 // signinRun triggers a sweep outside the schedule.
+//
+// The sweep runs detached from the request. A pool the size the button exists
+// for takes minutes to walk — every account costs an agent-side opening
+// sequence plus the claim, with a risk-control gap between them — and no HTTP
+// hop in front of the console (the Cloudflare edge in particular, which cuts
+// in at 100 seconds) should be asked to hold the connection for that long.
+// When the origin connection drops the request context dies with it and the
+// sweep aborts mid-pool, so keeping it synchronous does not only time out the
+// browser, it abandons half the accounts. The console polls the overview for
+// `running` and the eventual report instead.
 func (a *API) signinRun(w http.ResponseWriter, r *http.Request) {
-	report := a.signin.Sweep(r.Context())
-	if report == nil {
+	if a.signin.Running() {
 		writeError(w, http.StatusConflict, "已有签到任务在执行，请稍候")
 		return
 	}
+	go a.signin.Sweep(context.Background())
 	writeJSON(w, http.StatusOK, map[string]any{
-		"report":    report,
+		"started":   true,
+		"total":     len(a.store.ListAccounts()),
 		"nextRunAt": a.signin.NextRun(time.Now()),
 	})
+}
+
+// renewRun kicks off a renewal pass over the whole pool, detached from the
+// request like signinRun: a pool-wide walk costs one renewal per expiring
+// token plus the risk-control gap, minutes in the worst case.
+//
+// The loop normally handles this on its own half-hour cadence; the button
+// exists for the day the operator reads a renewal warning and does not want
+// to wait — or for a pool freshly imported from tokens that all expire soon.
+// Renewing an account whose token has time to spare is harmless but pointless,
+// so the manual pass uses the same skew window as the loop.
+func (a *API) renewRun(w http.ResponseWriter, r *http.Request) {
+	if !a.signin.StartRenewPass() {
+		writeError(w, http.StatusConflict, "已有续期任务在执行，请稍候")
+		return
+	}
+	go func() {
+		ctx := context.Background()
+		if !a.signin.RenewPassDetached(ctx) {
+			log.Printf("token 续期任务被取消")
+		}
+		a.signin.EndRenewPass()
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{"started": true})
+}
+
+// renewAccount renews one account's token and returns the new expiry, for the
+// console's per-account button.
+func (a *API) renewAccount(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	exp, err := a.signin.RenewOne(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"expiresAt": exp, "account": a.view(id)})
 }
 
 // signinAccount checks in a single account.
@@ -1458,6 +1579,25 @@ func (a *API) signinAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 // refreshCredit re-reads one account's balance.
+// activateAccount revives a cooling or exhausted account on demand — the
+// console's "put this account back to work" button. The pool owns the state
+// machine, so the handler only forwards the verdict.
+func (a *API) activateAccount(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	account, ok := a.store.AccountByID(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "账号不存在")
+		return
+	}
+	a.pool.ClearCooldown(id)
+	account, ok = a.store.AccountByID(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "账号不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, store.NewAccountView(account, a.pool.Inflight(id)))
+}
+
 func (a *API) refreshCredit(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	credit, err := a.signin.RefreshCredit(r.Context(), id)
@@ -1466,6 +1606,79 @@ func (a *API) refreshCredit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"credit": credit, "account": a.view(id)})
+}
+
+// refreshGrants re-reads one account's per-grant credit breakdown.
+func (a *API) refreshGrants(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	grants, err := a.signin.RefreshGrants(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"grants": grants, "account": a.view(id)})
+}
+
+// creditBreakdown serves the console's credit panel: the pool-wide aggregate
+// plus every account's cached per-grant breakdown, all read from the store.
+//
+// It never calls upstream. The data arrives through the background credit
+// poller (which fetches the breakdown on every pass) and per-account manual
+// syncs, so the panel opens instantly regardless of pool size. How stale each
+// account's breakdown is travels alongside it as grantsSyncedAt.
+func (a *API) creditBreakdown(w http.ResponseWriter, r *http.Request) {
+	accounts := a.store.ListAccounts()
+	now := time.Now()
+
+	type bucket struct {
+		Days    int     `json:"days"`
+		Credits float64 `json:"credits"`
+	}
+	items := make([]map[string]any, 0, len(accounts))
+	var totalRemaining, totalExpiredSoon float64
+	var synced int
+	for _, account := range accounts {
+		grants := make([]store.CreditGrant, 0, len(account.Grants))
+		var remaining float64
+		for _, grant := range account.Grants {
+			if grant.Remaining <= 0 {
+				continue
+			}
+			remaining += grant.Remaining
+			if !grant.ExpiresAt.IsZero() && grant.ExpiresAt.Before(now) {
+				// Fully expired but still reported by upstream; kept out of the
+				// distribution, which is about credits you can still spend.
+				continue
+			}
+			grants = append(grants, grant)
+		}
+		if !account.GrantsSyncedAt.IsZero() {
+			synced++
+		}
+		items = append(items, map[string]any{
+			"id": account.ID, "name": account.Name, "region": account.Region,
+			"enabled": account.Enabled, "status": account.Status,
+			"credit": account.Credit, "grants": grants,
+			"grantsRemaining": remaining,
+			"grantsSyncedAt":  account.GrantsSyncedAt,
+		})
+		totalRemaining += remaining
+		for _, grant := range account.Grants {
+			if grant.Remaining > 0 && !grant.ExpiresAt.IsZero() {
+				if grant.ExpiresAt.After(now) && grant.ExpiresAt.Before(now.Add(7*24*time.Hour)) {
+					totalExpiredSoon += grant.Remaining
+				}
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"totalRemaining":  totalRemaining,
+		"expiringIn7Days": totalExpiredSoon,
+		"accountsSynced":  synced,
+		"accountsTracked": len(items),
+		"items":           items,
+	})
 }
 
 func (a *API) view(id string) *store.AccountView {
@@ -1496,6 +1709,7 @@ func (a *API) listClientKeys(w http.ResponseWriter, r *http.Request) {
 		items = append(items, map[string]any{
 			"id": key.ID, "name": key.Name, "key": key.Key, "maskedKey": maskKey(key.Key),
 			"enabled": key.Enabled, "rpmLimit": key.RPMLimit, "maxConcurrent": key.MaxConcurrent,
+			"pool":          key.Pool,
 			"totalRequests": key.TotalRequests, "createdAt": key.CreatedAt, "lastUsedAt": key.LastUsedAt,
 		})
 	}
@@ -1514,6 +1728,7 @@ func (a *API) createClientKey(w http.ResponseWriter, r *http.Request) {
 		Name          string `json:"name"`
 		RPMLimit      int    `json:"rpmLimit"`
 		MaxConcurrent int    `json:"maxConcurrent"`
+		Pool          string `json:"pool"`
 	}
 	if err := decode(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "请求格式错误")
@@ -1523,7 +1738,7 @@ func (a *API) createClientKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "密钥名称不能为空")
 		return
 	}
-	key, err := a.store.CreateClientKey(strings.TrimSpace(payload.Name), maxInt(0, payload.RPMLimit), clampInt(payload.MaxConcurrent, 1, 256))
+	key, err := a.store.CreateClientKeyWithPool(strings.TrimSpace(payload.Name), maxInt(0, payload.RPMLimit), clampInt(payload.MaxConcurrent, 1, 256), payload.Pool)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1531,16 +1746,18 @@ func (a *API) createClientKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"key": map[string]any{
 		"id": key.ID, "name": key.Name, "key": key.Key, "maskedKey": maskKey(key.Key),
 		"enabled": key.Enabled, "rpmLimit": key.RPMLimit, "maxConcurrent": key.MaxConcurrent,
+		"pool":          key.Pool,
 		"totalRequests": key.TotalRequests, "createdAt": key.CreatedAt, "lastUsedAt": key.LastUsedAt,
 	}})
 }
 
 func (a *API) updateClientKey(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
-		Name          string `json:"name"`
-		Enabled       *bool  `json:"enabled"`
-		RPMLimit      *int   `json:"rpmLimit"`
-		MaxConcurrent *int   `json:"maxConcurrent"`
+		Name          string  `json:"name"`
+		Enabled       *bool   `json:"enabled"`
+		RPMLimit      *int    `json:"rpmLimit"`
+		MaxConcurrent *int    `json:"maxConcurrent"`
+		Pool          *string `json:"pool"`
 	}
 	if err := decode(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "请求格式错误")
@@ -1559,6 +1776,15 @@ func (a *API) updateClientKey(w http.ResponseWriter, r *http.Request) {
 		if payload.MaxConcurrent != nil {
 			key.MaxConcurrent = clampInt(*payload.MaxConcurrent, 1, 256)
 		}
+		if payload.Pool != nil {
+			pool := strings.TrimSpace(*payload.Pool)
+			if !strings.EqualFold(pool, "gongyi") {
+				pool = ""
+			} else {
+				pool = "gongyi"
+			}
+			key.Pool = pool
+		}
 	})
 	if err != nil {
 		writeError(w, http.StatusNotFound, "密钥不存在")
@@ -1567,6 +1793,7 @@ func (a *API) updateClientKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"key": map[string]any{
 		"id": key.ID, "name": key.Name, "key": key.Key, "maskedKey": maskKey(key.Key),
 		"enabled": key.Enabled, "rpmLimit": key.RPMLimit, "maxConcurrent": key.MaxConcurrent,
+		"pool":          key.Pool,
 		"totalRequests": key.TotalRequests, "createdAt": key.CreatedAt, "lastUsedAt": key.LastUsedAt,
 	}})
 }
@@ -1583,6 +1810,108 @@ func (a *API) deleteClientKey(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) listModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": a.store.ListModels()})
+}
+
+// refreshModels adopts the upstream model registry into the catalogue and runs
+// the deprecation lifecycle.
+//
+// The registry endpoint is public, so this works with an empty pool — which is
+// exactly when a stale catalogue is most likely to be noticed.
+//
+// Entries the registry does not list are *probed* rather than assumed dead: the
+// registry is a picker catalogue, and a model missing from it may still answer
+// under its own name (M2.7 and the preview alias did on 2026-10-20). The probe
+// catches the real failure mode — an unknown id is silently substituted with the
+// account's default model — and only then is the entry marked unavailable. A
+// marked entry is removed by the next *rotation*: the refresh that brings a new
+// model. Refreshing without anything new leaves the mark alone.
+func (a *API) refreshModels(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+
+	ids, err := a.client.PublicModels(ctx)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "读取上游模型清单失败："+err.Error())
+		return
+	}
+	if len(ids) == 0 {
+		writeError(w, http.StatusBadGateway, "上游模型清单为空，已保留现有目录")
+		return
+	}
+
+	listed := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		listed[strings.ToLower(strings.TrimSpace(id))] = true
+	}
+
+	// Only entries the registry omits need a probe. Already-marked entries are
+	// probed again so a recovery can be noticed, and so a second failure
+	// removes them.
+	unlisted := make([]*store.ModelConfig, 0, 4)
+	for _, model := range a.store.ListModels() {
+		if model.Type != store.ModelTypeChat {
+			continue
+		}
+		upstream := strings.ToLower(strings.TrimSpace(model.UpstreamModel))
+		if upstream == "" || listed[upstream] {
+			continue
+		}
+		if len(unlisted) >= maxModelProbes {
+			break
+		}
+		unlisted = append(unlisted, model)
+	}
+
+	available := make(map[string]bool, len(unlisted))
+	unavailable := make(map[string]bool, len(unlisted))
+	if cred, ok := a.probeCredential(); ok {
+		for _, model := range unlisted {
+			upstream := strings.TrimSpace(model.UpstreamModel)
+			probe, err := a.client.ProbeModel(ctx, cred, upstream)
+			if err != nil {
+				// An account problem says nothing about the model; leave the
+				// entry exactly as it is and let the next refresh decide.
+				continue
+			}
+			if probe.Served {
+				available[strings.ToLower(upstream)] = true
+			} else {
+				unavailable[strings.ToLower(upstream)] = true
+			}
+		}
+	}
+
+	result := a.store.SyncUpstreamModels(ids, available, unavailable)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"upstream":  ids,
+		"added":     result.Added,
+		"marked":    result.Marked,
+		"removed":   result.Removed,
+		"recovered": result.Recovered,
+		"total":     len(a.store.ListModels()),
+	})
+}
+
+// maxModelProbes bounds one refresh. The unlisted set is normally one or two
+// entries; the cap only matters if the catalogue was hand-edited into something
+// pathological, and it keeps a single click from turning into dozens of turns.
+const maxModelProbes = 12
+
+// probeCredential picks one account to run model probes with.
+//
+// It deliberately bypasses the pool: a probe failure is about the model, not the
+// account, so it must not consume a lease or cool an account down.
+func (a *API) probeCredential() (minimax.Credential, bool) {
+	for _, account := range a.store.ListAccounts() {
+		if account == nil || !account.Enabled || strings.TrimSpace(account.Token) == "" {
+			continue
+		}
+		if account.Status == store.StatusInvalid || account.Status == store.StatusDisabled {
+			continue
+		}
+		return gateway.CredentialOf(account), true
+	}
+	return minimax.Credential{}, false
 }
 
 func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
@@ -1682,12 +2011,16 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 			"baseURL": settings.Upstream.BaseURL, "baseURLCN": settings.Upstream.BaseURLCN,
 			"agentID":     settings.Upstream.AgentID,
 			"sessionPath": settings.Upstream.SessionPath, "messagePath": settings.Upstream.MessagePath,
+			"mode":            settings.Upstream.Mode,
+			"modelPath":       settings.Upstream.ModelPath,
+			"modelsPath":      settings.Upstream.ModelsPath,
 			"userInfoPath":    settings.Upstream.UserInfoPath,
 			"agentListPath":   settings.Upstream.AgentListPath,
 			"configPath":      settings.Upstream.ConfigPath,
 			"connectionsPath": settings.Upstream.ConnectionsPath,
 			"summariesPath":   settings.Upstream.SummariesPath,
 			"driveFilePath":   settings.Upstream.DriveFilePath,
+			"uploadsPath":     settings.Upstream.UploadsPath,
 			"modelPayload":    settings.Upstream.ModelPayload,
 			"language":        settings.Upstream.Language,
 			"screenWidth":     settings.Upstream.ScreenWidth, "screenHeight": settings.Upstream.ScreenHeight,
@@ -1710,14 +2043,14 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) saveSettings(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
-		Server        *config.ServerSettings   `json:"server"`
-		Upstream      *config.UpstreamSettings `json:"upstream"`
-		Routing       *config.RoutingSettings  `json:"routing"`
-		Audit         *config.AuditSettings    `json:"audit"`
-		Media         *config.MediaSettings    `json:"media"`
-		Signin        *config.SigninSettings   `json:"signin"`
-		Video         *config.VideoSettings    `json:"video"`
-		AdminPassword string                   `json:"adminPassword"`
+		Server   *config.ServerSettings   `json:"server"`
+		Upstream *config.UpstreamSettings `json:"upstream"`
+		Routing  *config.RoutingSettings  `json:"routing"`
+		Audit    *config.AuditSettings    `json:"audit"`
+		Media    *config.MediaSettings    `json:"media"`
+		Signin   *config.SigninSettings   `json:"signin"`
+		Video    *config.VideoSettings    `json:"video"`
+		AdminKey string                   `json:"adminKey"`
 	}
 	if err := decode(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "请求格式错误")
@@ -1744,7 +2077,24 @@ func (a *API) saveSettings(w http.ResponseWriter, r *http.Request) {
 			settings.Media = *payload.Media
 		}
 		if payload.Signin != nil {
+			// SlotSeed and the legacy Hour/Minute are derived or superseded, not
+			// operator input: the console no longer sends them, and a wholesale
+			// struct replace would blank them. A blanked seed would re-scatter
+			// every future daily slot on each settings save; blanked hour/minute
+			// would only matter as the pre-seed fallback, but 0:00 as that
+			// fallback is a Beijing-midnight slot the window deliberately
+			// avoids. Preserve all three.
+			seed := settings.Signin.SlotSeed
+			hour, minute := settings.Signin.Hour, settings.Signin.Minute
 			settings.Signin = *payload.Signin
+			settings.Signin.SlotSeed = seed
+			settings.Signin.Hour = hour
+			settings.Signin.Minute = minute
+			if seed == "" {
+				// A store saved before the first seed issuance: settle it now
+				// through the same lazy path the scheduler uses.
+				settings.Signin.SlotSeed = a.store.SigninSlotSeed()
+			}
 		}
 		if payload.Video != nil {
 			settings.Video = *payload.Video
@@ -1754,13 +2104,8 @@ func (a *API) saveSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if payload.AdminPassword != "" {
-		admin := a.store.AdminProfile()
-		username := admin.Username
-		if payload.Server != nil && strings.TrimSpace(payload.Server.AdminUsername) != "" {
-			username = strings.TrimSpace(payload.Server.AdminUsername)
-		}
-		if err := a.store.SetPassword(username, payload.AdminPassword); err != nil {
+	if payload.AdminKey != "" {
+		if err := a.store.SetKey(payload.AdminKey); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}

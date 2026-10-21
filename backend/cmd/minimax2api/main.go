@@ -25,7 +25,7 @@ import (
 func main() {
 	cfg := config.Load()
 
-	st, err := store.Open(cfg.DataDir, cfg.AdminUser, cfg.AdminPassword)
+	st, err := store.Open(cfg.DataDir, cfg.AdminUser, cfg.AdminKey)
 	if err != nil {
 		log.Fatalf("初始化数据存储失败: %v", err)
 	}
@@ -53,7 +53,7 @@ func main() {
 	registerDebug(mux)
 	registerStatic(mux, cfg.StaticDir)
 
-	handler := withLogging(withCORS(mux))
+	handler := withSecurity(withLogging(mux))
 	addr := st.Settings().Server.Addr
 	if cfg.Addr != "" {
 		addr = cfg.Addr
@@ -74,6 +74,8 @@ func main() {
 	runCtx, stopRun := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopRun()
 	signinSvc.Start(runCtx)
+	// Public-welfare pool: water-level push + credit rotation.
+	api.StartGongyi(runCtx)
 
 	go func() {
 		log.Printf("MiniMax2API %s 已启动 · 管理台 http://%s · 数据目录 %s", gateway.Version, displayAddr(addr), cfg.DataDir)
@@ -144,9 +146,17 @@ func registerStatic(mux *http.ServeMux, staticDir string) {
 			serveIndex(w, r)
 			return
 		}
-		// API prefixes are registered separately; anything else falls back to
-		// the SPA entry point when the file does not exist.
-		if _, err := os.Stat(filepath.Join(staticDir, filepath.Clean(strings.TrimPrefix(path, "/")))); err != nil {
+		// API prefixes are registered separately; unknown *file-like* paths must
+		// 404 (previously every miss returned index.html, which made /data/app.json
+		// and /.env look like 200s to scanners). Only extensionless SPA routes
+		// fall back to the shell.
+		clean := filepath.Clean(strings.TrimPrefix(path, "/"))
+		if _, err := os.Stat(filepath.Join(staticDir, clean)); err != nil {
+			if strings.HasPrefix(path, "/assets/") || filepath.Ext(clean) != "" ||
+				strings.HasPrefix(path, "/.") || strings.Contains(path, "/.") {
+				http.NotFound(w, r)
+				return
+			}
 			serveIndex(w, r)
 			return
 		}
@@ -174,19 +184,21 @@ func displayAddr(addr string) string {
 	return addr
 }
 
-func withCORS(next http.Handler) http.Handler {
+func withSecurity(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("origin")
-		if origin != "" {
-			w.Header().Set("access-control-allow-origin", origin)
-			w.Header().Set("access-control-allow-credentials", "true")
-			w.Header().Set("access-control-allow-headers", "authorization,content-type,x-api-key,x-session-id")
-			w.Header().Set("access-control-allow-methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-		}
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+		// Behind cloudflared the origin always sees plain HTTP; the client
+		// scheme is in X-Forwarded-Proto. Redirect plaintext clients instead of
+		// serving keys/cookies over HTTP.
+		if r.Header.Get("X-Forwarded-Proto") == "http" {
+			target := "https://" + r.Host + r.URL.RequestURI()
+			http.Redirect(w, r, target, http.StatusMovedPermanently)
 			return
 		}
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'none'")
+		w.Header().Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
 	})
 }

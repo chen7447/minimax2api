@@ -38,9 +38,15 @@
 - `GET /v1/models` — 模型列表
 - `GET /health` — 健康检查 + 号池概览
 
-**函数调用（模拟）**
-- 请求里的 `tools` 声明会被接受，模型的调用意图被解析成标准的 `tool_calls`（OpenAI）与 `tool_use`（Anthropic），流式与非流式都支持
-- ⚠️ **这是模拟，不是原生支持**：上游的消息体里没有任何可以承载工具声明的字段，网关只能用提示词约定来模拟。能力边界、代价和为什么不建议依赖它，见「函数调用」一节
+**上游两条通道**
+- `upstream.mode` 决定对话走哪条上游，**默认 `agent`，不改变现有行为**：
+  - `agent` — Agent 会话接口（`/minimax-cloud/api/v1/session/{id}/message`）。本项目一直用的那条，也是**视频与图像唯一能走的一条**（它们在上游的插件层）。
+  - `direct` — 官方客户端真正用来跑模型的那条端点（`/mavis/api/v1/llm/v1/messages`，Anthropic Messages 协议）。**原生 tool use**、结构化 messages、无会话、无回显。
+- 要用 Claude Code / ZCode / 任何工具循环，**必须选 `direct`**。详见「上游有两条通道」
+
+**函数调用**
+- `direct` 模式下是**原生**的：`tools` 是一个真正的请求字段，`tool_use` / `tool_calls` 是上游自己产出的，不是解析出来的
+- `agent` 模式下是**模拟**的：上游消息体里没有任何字段能承载工具声明，网关只能用提示词约定来模拟。能力边界与代价见「函数调用」一节
 
 **双区域账号池（国内 + 国际）**
 
@@ -101,7 +107,7 @@ MiniMax 的每个 API 请求都要带一个 `yy` 签名，而这个签名是**�
 - 仪表盘：调用量趋势、模型分布、账号排行、资源占用
 - 号池管理、客户端密钥、模型目录、生成画廊、请求审计、系统设置
 - 中英双语，明暗双主题
-- 管理端会话基于 Bearer Token，密码用 HMAC-SHA256 迭代 12 万次加盐存储
+- 管理端**单密钥**登录（无用户名 / 密码）：会话基于 Bearer Token，密钥用 HMAC-SHA256 迭代 12 万次加盐存储；同一把 key 也能直接当 Bearer 调 `/admin/api/*`
 
 **审计**
 - 每次网关请求落一条记录（模型、账号、状态码、耗时、token 数）
@@ -134,13 +140,14 @@ go build -o ../minimax2api ./cmd/minimax2api
 ### 运行
 
 ```bash
-# 指定初始管理员密码（首次启动写入，之后改密走管理台）
-MINIMAX2API_ADMIN_PASSWORD=你的密码 ./minimax2api -addr 127.0.0.1:8080
+# 指定初始管理员密钥（首次启动写入，之后改密钥走管理台）
+MINIMAX2API_ADMIN_KEY=mm2api-你的密钥 ./minimax2api -addr 127.0.0.1:8080
 ```
 
-打开 `http://127.0.0.1:8080`，用 `admin` / 你设置的密码登录。
+打开 `http://127.0.0.1:8080`，粘贴这把密钥登录（**单密钥，没有用户名**）。
 
-> 不传 `MINIMAX2API_ADMIN_PASSWORD` 时，首次启动会随机生成一个密码并打印在控制台。
+> 不传 `MINIMAX2API_ADMIN_KEY` 时，首次启动会随机生成一个密钥并打印在控制台。
+> 同一把 key 也可直接调管理 API：`curl -H "Authorization: Bearer mm2api-…" http://127.0.0.1:8080/admin/api/dashboard`
 
 ### 加号
 
@@ -168,6 +175,56 @@ cn:eyJhbGciOiJIUzI1NiIs...
 > 已经存在的账号会被**更新**而不是报错——令牌过期后重新导入同一行就能刷新。
 >
 > `主号----令牌` 里的「主号」只是账号名，不参与区域判断；要按行指定区域得写成三段的 `名称----令牌----cn`。
+
+### 浏览器抓取（不用手工翻 Token）
+
+管理台 → **号池管理** → 添加账号 → **浏览器抓取**：选国内站或国际站，点「开始抓取」，本机 Chrome 会打开 MiniMax，你在窗口里登录，登录成功后凭证**自动入库**——连指纹一起。
+
+抓到的三样东西来自网页端自己：
+
+| 来源 | 用途 |
+| --- | --- |
+| `localStorage._token` | 登录令牌（JWT） |
+| `localStorage.UNIQUE_USER_ID` | 浏览器指纹 `uuid` |
+| `sessionStorage.tab_device_id` | 浏览器指纹 `device_id`（八位数字） |
+
+后两个是**真实指纹**，比自动生成的那组更接近上游看到的客户端；重新抓同一个账号会用新指纹覆盖旧的，这也是刷新过期令牌的推荐方式。
+
+**浏览器跑在你自己的机器上，不是服务器上。** 凭证在另一个源的 localStorage 里，任何页面都读不到它，所以流程是反过来的：控制台发布一个「抓取请求」，你本机的一个助手接单、开浏览器、等你登录、把凭证回传。于是：
+
+- 服务器上不需要装 Chrome，部署包不变；
+- 登录（短信、扫码、滑块）走的是你本机真实浏览器，不受影响；
+- 助手没在线时，对话框会直接说「本机助手未运行」，并给出启动命令。
+
+**启动助手**（在你的机器上，项目目录里）：
+
+```bat
+Minimax2api.bat capture
+```
+
+助手常驻，每 2 秒问一次控制台有没有活。**浏览器用独立 profile**（默认 `%LOCALAPPDATA%\minimax2api-capture-profile`），所以登录一次之后就一直有效——之后再抓，秒回。
+
+配置文件 `capture.local.json` 放在**仓库的上一级目录**（`F:\Minimax2api\capture.local.json`，和 `secrets-local.md` 同处，不进版本库）：
+
+```json
+{
+  "base": "https://minimax2api.7447.site",
+  "key": "mm2api-……"
+}
+```
+
+也可以全部走命令行：`node tools/capture.mjs --base <地址> --key <管理员密钥> [--once] [--verbose]`。
+
+> `--verbose` 会把页面里**存储键的名字**（只有名字，没有值）打出来。上游哪天改了键名，抓取会突然什么都拿不到，日志里那几个键名就是定位它的唯一线索。
+
+**抓取态与取消**
+
+- 抓取请求在服务端有 **3 分钟 TTL**：助手挂了、或者你根本没登录，到点自动结束，不会一直挂着。
+- 对话框里的 **强行取消** 任何时候都能按，且**不依赖助手在线**——它结束的是服务端那个请求；助手下次轮询会看到「已取消」并关掉浏览器窗口。
+- 直接关掉对话框 = 放弃这次抓取（等价于取消）。
+- 助手自己也会盯着状态：被取消、超时、或者被新的请求顶替，都会立刻关掉浏览器退回待命。
+
+> 国内站与国际站是两套独立账号库，令牌互不通用，站点选错会一路 `401`。两个域名的**网页端**可能互相跳转（实测 `agent.minimax.io` → `agent.minimaxi.com` → `agent.minimax.cn`），所以站点选择决定的是**账号属于哪个部署**，而不是浏览器最终停在哪一页。
 
 ### 调用
 
@@ -219,7 +276,8 @@ curl http://127.0.0.1:8080/v1/messages \
 | 模型 ID | 类型 | 说明 |
 | --- | --- | --- |
 | `minimax-agent` | chat | 通用 Agent，自动规划并调用工具（默认） |
-| `minimax-m3.1-flash-preview` | chat | 桌面端新增的预览版；支持 `reasoning_effort` 档位 |
+| `minimax-m3.1-flash` | chat | 当前一代对话模型；上游 2026-10 由 Preview 转正 |
+| `minimax-m3.1-flash-preview` | chat | 旧名称，上游已改名为 M3.1 Flash；保留作兼容别名 |
 | `minimax-m3` | chat | 对话模式，响应更快 |
 | `minimax-m3-thinking` | chat | 深度思考模式，推理内容走 `reasoning_content` |
 | `minimax-m2.7` | chat | 上一代对话模型 |
@@ -229,12 +287,23 @@ curl http://127.0.0.1:8080/v1/messages \
 | `minimax-h3-max` | video | H3 Max，约 20 秒完成；仅文生视频与首/尾帧；480P/768P；5-15 秒 |
 | `minimax-hailuo-2-3` | video | Hailuo 2.3，成本更低；可用 Token Plan；输出无声视频 |
 
-> **chat 类模型 ID 最终打的是同一个上游 Agent**，上游按账号默认的模型回答——包括 `minimax-m3.1-flash-preview` / `minimax-m2.7` / `minimax-m2.7-highspeed` 在内，所有对话条目都只是标签，**没有任何一个会把模型选择传给上游**。
+> **`direct` 通道下模型 ID 是真正生效的**：目录里的 `upstream_model` 就是发给 `/mavis/api/v1/llm/v1/messages` 的 `model` 字段（`MiniMax-M3.1-Flash` / `MiniMax-M3` / `MiniMax-M2.7` / `MiniMax-M2.7-highspeed`）。上游清单用 `GET /mavis/api/v1/models` 读（**公开接口，不需要鉴权**），每个模型的 `tool_call` 都是 `true`。
 >
-> 上游桌面端确实长出了模型选择器（M3.1-Flash-Preview / M3 / M2.7 / M2.7 HighSpeed），选择走在消息请求体里。**形状于 2026-09-28 抓到**：
+> **模型目录的刷新与退役**（管理台「模型」页 → **从上游刷新**，`POST /admin/api/models/refresh`）：
+>
+> 1. 清单里有、目录里没有的 chat 模型 → 加入目录，**置顶并标 `NEW`**，标记只保留一轮。
+> 2. 清单里没有的条目 → **逐个实际探活**（发一次 `max_tokens=1` 的请求，看响应回显的 `model` 是不是它自己）。上游对不认识的 id 不会报错，而是**静默换成账号默认模型**并回显那个名字，所以只能靠回显判断。实测 2026-10-20：`M2.7` / `M2.7-highspeed` / `M3.1-Flash-Preview` 都不在清单里，但回显仍是自己，属于"清单外但可用"，**不动**。
+> 3. 探活发现被替换（或 400 invalid model）→ 标记为**不可调用**：置底、划线、开关禁用，并从 `/v1/models` 隐藏；此时调用该模型直接返回 **400「该模型已不可调用，请及时更新新模型」**，不会静默换成别的模型。
+> 4. **轮换才删除**：只有当下一次刷新**带来新模型**时，之前被标记的旧模型才会被彻底移除（留 tombstone，重启不会被内置列表复活）。如果只是一直刷新、没有新模型，划线状态会一直保留——删除跟着"新模型到来"走，不跟着"又刷了一次"走。探活恢复可用的条目则直接取消标记。
+>
+> 这对应 New API 渠道配置或 agent 客户端模型列表没及时更新的情况：旧名字不会"假装还能用"，而是明确报错。下面这一段只适用于 `agent` 通道。
+>
+> **chat 类模型 ID 最终打的是同一个上游 Agent**，上游按账号默认的模型回答——包括 `minimax-m3.1-flash` / `minimax-m3.1-flash-preview` / `minimax-m2.7` / `minimax-m2.7-highspeed` 在内，所有对话条目都只是标签，**没有任何一个会把模型选择传给上游**。
+>
+> 上游桌面端确实长出了模型选择器（M3.1-Flash / M3 / M2.7 / M2.7 HighSpeed），选择走在消息请求体里。**形状于 2026-09-28 抓到**：
 >
 > ```json
-> {"provider_id":"minimax","model_id":"MiniMax-M3.1-Flash-Preview","reasoning":true,"thinking":{"effort":"max"},"context_limit":512000}
+> {"provider_id":"minimax","model_id":"MiniMax-M3.1-Flash","reasoning":true,"thinking":{"effort":"max"},"context_limit":512000}
 > ```
 >
 > 把这段原文填进「系统设置 → 上游 → `model` 字段模板」即可，网关会原样发送，不用等发版。2026-09-27 的教训是**别自己合成**：按惯例拼一个 `{"id": "MiniMax-M3"}` 塞进去，上游一律 400 `invalid model selection`（1406010011），当天所有对话模型 502。
@@ -312,9 +381,94 @@ data:{"type":2,"agent_message":{"msg_id":"…","role":"assistant","msg_type":1,
 
 ---
 
+## 上游有两条通道
+
+网关能把请求送到上游的**两个不同地方**，它们不是同一种东西的两种写法。`upstream.mode` 选哪一条，**默认 `agent`**（不改变任何现有安装的行为）。
+
+| | `agent`（默认） | `direct` |
+| --- | --- | --- |
+| 端点 | `/minimax-cloud/api/v1/session/{id}/message` | `/mavis/api/v1/llm/v1/messages` |
+| 协议 | 自有：一条 `content` 字符串 + 一屋子 `agent_*` 帧 | Anthropic Messages（结构化 messages、`tool_use`、标准 SSE） |
+| 鉴权 | `token` + `x-timestamp` + `x-signature` + `yy` + 22 项指纹查询串 | 只要 `Authorization: Bearer <token>` |
+| 会话 | 每次新建，上游自己记上下文 | 无会话，上下文由调用方自管 |
+| 对面是谁 | **MiniMax 自己的云端 Agent**（Mavis） | **模型本身** |
+| 工具声明 | 没有字段能装，只能提示词模拟 | `tools` 是真字段，`tool_use` 是原生产出 |
+| 回显 / 重复 | 有（回显帧与整条重述帧） | 无 |
+| 模型选择 | 所有 id 打同一个 Agent，`model` 字段是标签 | `model` 真正决定跑哪个模型 |
+| 视频 / 图像 | ✅ 唯一入口（上游插件层） | ❌ 没有这条通道 |
+
+### 一个反直觉的坑：别让上游看见 `Accept-Encoding: gzip`
+
+两条通道都踩同一个雷，而且症状完全不像压缩问题。
+
+Go 的 `http.Transport` 在没有显式设置时会**自动加上** `Accept-Encoding: gzip`。这个上游看到这个声明，会**把整个响应憋住、压缩完再发**——SSE 也不例外：
+
+| 通道 | 声明 gzip | 声明 identity |
+| --- | --- | --- |
+| 直连模型 API | 2 次读，**全部挤在 8.9s** | 277 次读，从 **547ms** 起铺开 |
+| Agent 会话接口 | **1 次读**；`getresponse()` 一直阻塞到生成结束才拿到响应头 | 首块 **2630ms**，5 次读铺到 7675ms |
+
+> 2026-10-06 实测（`agent.minimax.io`，同一账号、同一提问）。压缩是**上游侧**的行为，不是 Go 的缓冲——用 python 逐字节读、不声明 gzip 时，同一端点 20–40ms 一个 delta。
+
+所以 `internal/minimax` 做了两件事：`Transport.DisableCompression = true`（从源头不加这个头），**并且**对每个流式请求显式写 `Accept-Encoding: identity`（意图写死，不依赖传输层配置）。非流式请求不动——那边没有可缓冲的东西，压缩是净赚。
+
+> **这条值得单独记一笔**，因为它伪装成"模型很慢"。Agent 通道长期被观察到的「首字节迟滞数十秒」里，有一大块是它：客户端连响应头都拿不到，因为上游在攒压缩包。回归测试钉在 `internal/minimax/compression_test.go`。
+
+### 为什么需要 `direct`
+
+因为 `agent` 那条**不是模型接口，是别人的 Agent 产品**。它的系统提示词定义了它是谁、在哪：
+
+- 它自称 Mavis / MiniMax Agent，不采纳你给的系统提示词；
+- 它认为自己跑在**自己的 Linux 沙箱**里（`/workspace`、`/root`），于是**拒绝任何关于调用方本机的事**——「我跑在云端沙箱里，碰不到你电脑的桌面」；
+- 它有自己的长期记忆，会把不相关的上下文带进回答；
+- 它有自己的服务端工具（`bash` 等），**由它自己执行**——转发出去就是谎报「这个调用该由你来跑」。
+
+结果是：**它接不了 agent 骨架**。工具调用命中率低、参数指向它自己的沙箱、名字还会被改成小写（`Write` → `write`）。2026-10-06 实测：同一句「请在我的电脑桌面新建 test.txt」，`m3.1-flash-preview` / `minimax-agent` / `m3` / `m2.7` **全部**回「我跑在云端沙箱里」；同一时刻 `glm-5.3` / `qwen-3.8-max` / `deepseek-v4.1-flash` 走各自的原生模型接口，工具调用正常。
+
+> 也试过换 agent 角色：账号下除 `mavis` 外还有 `general` / **`coder`** / `verifier` / `chat`，但 `coder`（「Hands-on software engineer」）同样是**它自己的沙箱 Agent**——它会「在沙箱里把文件建好」然后告诉你没写进你本机。换角色换不掉这条通道的性质。
+
+### `direct` 是怎么找到的
+
+官方客户端跑模型回合时**根本不用**那条 Agent 会话接口，它用的是 `/mavis/api/v1/llm/v1/messages`。同一个账号实测：
+
+```bash
+# 模型清单（也是「上游模型名」该填什么）
+GET https://agent.minimax.io/mavis/api/v1/models      # 公开接口，无需鉴权
+# 2026-10-20 → MiniMax-M3.1-Flash / MiniMax-M3（whitelist 另含 M2.7 / M2.7-highspeed），全部 tool_call: true
+
+# 一轮对话
+POST https://agent.minimax.io/mavis/api/v1/llm/v1/messages
+{"model":"MiniMax-M3","max_tokens":8192,"stream":true,
+ "system":"…","messages":[…],
+ "tools":[{"name":"Write","description":"…","input_schema":{…}}]}
+# → {"content":[{"type":"text",…},{"type":"tool_use","id":"call_…","name":"Write",
+#                "input":{"file_path":"C:\\Users\\…\\Desktop\\test.txt","content":"hi"}}],
+#    "stop_reason":"tool_use"}
+```
+
+路径与协议的出处：同类项目 `Zhengyuuuui/minimax2api`（Python）先踩了这个坑并把上游换成了直连模型 API，这里的实测与它一致。
+
+### 怎么切
+
+管理台「系统设置 → 上游 → 上游通道」选 `direct`（`upstream.mode`），或：
+
+```bash
+curl -X PUT https://<你的网关>/admin/api/settings \
+  -H "Authorization: Bearer <管理密钥>" -H 'content-type: application/json' \
+  -d '{"upstream":{...完整字段...,"mode":"direct"}}'
+```
+
+> ⚠️ 这个接口是**整体替换** `upstream` 段，不是逐字段合并：只发 `{"upstream":{"mode":"direct"}}` 会把其余上游设置清成默认值。管理台会回传完整对象，用命令行请照抄 `GET /admin/api/settings` 的结果再改 `mode`。
+
+切过去之后，`agent` 那套模拟链路（拍平、回显剥离、重复抑制、`<tool_calls>` 注入与解析）在这条通道上**全部不参与**——它们是死代码，但保留着，因为切回 `agent` 就还要用。
+
+---
+
 ## 函数调用
 
-**先说结论：上游没有这条通道，这里是模拟的。** 只想要一个能跑的 OpenAI 兼容网关的话，这一节可以跳过；打算依赖函数调用的话，请读完再决定。
+> 本节讲的是 **`agent` 通道**下的函数调用。`direct` 通道下工具是原生字段，没有这一节说的任何限制——见「上游有两条通道」。
+
+**先说结论：`agent` 通道下上游没有这条通道，这里是模拟的。** 只想要一个能跑的 OpenAI 兼容网关的话，这一节可以跳过；打算依赖函数调用的话，请读完再决定。
 
 ### 上游为什么做不到原生支持
 
@@ -386,7 +540,7 @@ Claude 客户端会发自己的模型 id（`claude-sonnet-4-20250514` 之类）�
 | --- | --- |
 | `system`（字符串或块数组） | 拍成 `[系统指令] …` 前缀 |
 | `content` 里的 `text` 块 | 正文 |
-| `content` 里的 `image` 块 | 转成图片附件，与 OpenAI 路径同一套（见「关于图片」） |
+| `content` 里的 `image` 块 | 转成图片附件，与 OpenAI 路径同一套（见「关于图片」）。`url` 与 `base64` 两种 source 都收：base64 会折成 data URI 走同一条上传路径 |
 | `content` 里的 `tool_use` / `tool_result` 块 | 渲染成散文。上游没有承载它们的结构化通道，但它们是下一轮回答所依赖的上下文，丢掉等于悄悄改了问题 |
 | `thinking` 块 | 不回放。那是模型自己产生过的推理，重放只是每轮多花 token |
 
@@ -544,14 +698,14 @@ message_start → content_block_start → content_block_delta… → content_blo
 | `-addr` | `MINIMAX2API_ADDR` | `127.0.0.1:8080` | 监听地址 |
 | `-data` | `MINIMAX2API_DATA` | `data` | 数据目录 |
 | `-static` | `MINIMAX2API_STATIC` | `frontend/dist` | 前端产物目录 |
-| `-admin-user` | `MINIMAX2API_ADMIN_USER` | `admin` | 初始管理员用户名 |
-| `-admin-password` | `MINIMAX2API_ADMIN_PASSWORD` | 随机 | 初始管理员密码 |
+| `-admin-user` | `MINIMAX2API_ADMIN_USER` | `admin` | 管理员名称（仅显示，登录不用） |
+| `-admin-key` | `MINIMAX2API_ADMIN_KEY` | 随机 | 初始管理员密钥（单密钥登录） |
 
 ### 运行时设置
 
 以下配置存在 `data/app.json` 里，可在管理台「系统设置」直接改，改完即时生效：
 
-- **服务**：最大并发请求数、管理员用户名
+- **服务**：最大并发请求数、管理员名称（仅显示）
 - **上游**：国际站/国内站地址、默认 Agent ID、会话与消息路径、**agent 列表 / 初始化 / 连接列表三条路径**、`model` 字段模板、默认屏幕尺寸、语言、请求超时、流空闲超时、**代理（国际站必填，见「出口 IP」）**、身份查询路径、User-Agent
 - **路由**：调度策略、冷却基数/上限、最大重试次数、容量等待、粘性会话 TTL、是否优先空闲账号
 - **审计**：保留天数、最大记录数、是否记录请求体、请求体长度上限
@@ -668,10 +822,23 @@ data:{"type":6,"agent_message_chunk":{"msg_content":"你好"}}
 
 ### 关于图片
 
-MiniMax 的附件走的是带签名的上传通道，无法从外部复刻，因此图片以 **URL 形式**转发给上游：
+图片不再以 URL 转发，而是**先上传到账号自己的对象存储，再以 `object_key` 挂到消息上**。上游已经改了规则：附件必须是「账号自己拥有的 `object_key`」或白名单里的 legacy URL，任何外部 URL 都会被 400 拒绝——
 
-- `http(s)` 图片地址直接透传
-- `data:` 内联图片会写入媒体目录并改用「媒体公开前缀」重新发布——上游需要能自己下载到它；没配置公开前缀时会直接报错说明，而不是发出去静默失败
+```
+[1406010011] attachment requires one owned object_key or allowed legacy URL
+```
+
+所以流程是（照 Web 端 bundle 复刻，已真机验证）：
+
+1. `POST /minimax-cloud/api/v1/uploads/prepare`（`purpose=1`）→ 返回 `object_key` 与一段 OSS POST 策略
+2. 按策略把文件 multipart POST 到 OSS → 204
+3. 消息附件写成 `{meta:{attachment_type,file_name,mime_type,size_bytes}, cloud:{object_key}}`
+
+附件必须是这个**嵌套形状**；扁平的 `{type,file_path,…,object_key}` 会被同一句 400 拒掉（那是远程控制模式才用的写法）。`object_key` 归上传它的账号所有，所以上传按「每次尝试的账号」做：换账号重试会重新上传。
+
+**只收内联图片**（`data:` URI）。`http(s)` 图片地址会被 400 拒绝：上游只认「从请求里上传上来的图」，网关去下载调用方给的地址属于凭空造能力——上游自己不做这件事——而且会把网关的网络出口暴露给调用方指定的目标。错误信息里写明「改用 data: URI」。
+
+`uploadsPath` 可在「系统设置 → 上游」里改（留空用默认值）。
 
 ### 签到与积分
 
@@ -758,9 +925,9 @@ backend/
   internal/config/      启动参数 + 运行时设置模型
   internal/store/       状态与持久化（含回归测试）
   internal/pool/        号池调度
-  internal/minimax/     上游协议客户端（签名、会话、SSE、令牌解析、签到/积分、身份与 agent 发现）
+  internal/minimax/     上游协议客户端（两条通道：agent 会话接口 + direct 模型 API；签名、会话、SSE、令牌解析、签到/积分、身份与 agent 发现）
   internal/signin/      每日签到调度 + 积分轮询（不含 HTTP，客户端注入）
-  internal/gateway/     OpenAI 与 Anthropic 兼容层、函数调用模拟、限流
+  internal/gateway/     OpenAI 与 Anthropic 兼容层、两条通道的协议映射（direct.go）、函数调用模拟、限流
   internal/admin/       管理台 API
 frontend/
   src/app/              壳层与路由
@@ -773,6 +940,7 @@ tools/
   fields.py             DTO 字段契约检查（响应字段 / TS 类型）
   signin_e2e.py         签到 + 积分链路端到端（内置假上游）
   render.mjs            真实浏览器渲染 + 控制台流程检查（CDP，需本机 Chrome）
+  capture.mjs           本机凭证抓取助手（控制台「浏览器抓取」的另一半）
   secret_scan.py        工作树 + 全历史密钥扫描（推送前跑）
   hooks/pre-commit      提交前自动跑 secret_scan.py --tree-only
 assets/
@@ -831,6 +999,9 @@ go vet ./...
 | `internal/gateway` | 端到端请求路径——鉴权、限流、故障转移、OpenAI 响应格式、流式、审计、图像、内联图片拒绝、**模型目录里的每一种类型都能在对话接口上用（图像模型回 Markdown 图片，流式也是合法 SSE）**、**媒体链接补成绝对地址（公开前缀 > 代理头 > Host）**、**视频轮次带 `client_intent` 而普通对话不带**、**只存在于网盘的成品也能被取回**、取件失败不污染这一轮的结果 |
 | `internal/gateway`（Anthropic） | `/v1/messages` 的形状——消息对象、事件序列的顺序、未知模型名回落、鉴权错误的信封、`system` 与 `tool_result` 进提示词、图片块不丢、工具调用转 `tool_use` |
 | `internal/gateway`（函数调用） | 注入的提示词含声明、解析器接受多行与字符串化的 `arguments`、**读不懂的块原样保留**、**没声明工具时块一个字符都不动**、流式扣留标记的跨帧与 rune 边界 |
+| `internal/gateway`（direct 通道） | OpenAI 请求被翻成结构化 messages（`system` 单独成字段、`tool_calls` → `tool_use`、`tool` → `tool_result`、**连续的工具结果合并进同一条 user 轮次**）、`tool_use` 原样转回 `tool_calls` / `tool_use`、**上游请求体里不得出现 `<tool_calls>` 注入**、流式工具调用的 `input_json_delta` 片段拼装、**`agent` 通道行为不受影响（切通道不等于改通道）** |
+| `internal/minimax`（传输层） | **流式请求不得声明 gzip**（上游会缓冲整条流）、传输层不开压缩、非流式请求不受影响 |
+| `internal/minimax`（direct 通道） | 请求只带 `Authorization: Bearer`（**不得出现 `x-signature` / `yy` / 指纹查询串**）、`tools` 作为字段而非提示词、SSE 事件序列的拼装（文本 / 推理 / 工具参数片段）、截断的参数退化成 `{}` 而不是非法 JSON、`error` 事件必须冒泡、模型清单解析、`401` 判为凭据失效 |
 | `internal/gateway`（上游桩） | 用 `httptest` 顶替上游，因此不需要真实令牌就能覆盖完整链路 |
 
 > `pool` 里的死锁与并发用例用 `channel + timeout` 断言，而不是裸 `t.Fatal`——测试进程卡住时，超时能给出失败信息而不是整体挂起。
@@ -839,7 +1010,7 @@ go vet ./...
 
 ```bash
 # 先启动服务，然后：
-python tools/smoke.py --base http://127.0.0.1:8080 --password 你的密码 --skip-upstream
+python tools/smoke.py --base http://127.0.0.1:8080 --key 你的密钥 --skip-upstream
 ```
 
 `--skip-upstream` 会跳过真正打上游的用例（没有有效令牌时会一直等到超时），其余约 50 项断言全部覆盖管理台、网关错误路径与号池行为。
@@ -847,7 +1018,7 @@ python tools/smoke.py --base http://127.0.0.1:8080 --password 你的密码 --ski
 签到链路：
 
 ```bash
-python tools/signin_e2e.py --base http://127.0.0.1:8080 --password 你的密码
+python tools/signin_e2e.py --base http://127.0.0.1:8080 --key 你的密钥
 ```
 
 签到没有账号就测不了，所以这个脚本在**自己进程里**起一个假上游，把两个一次性账号的 `baseURL` 指过去，再从外部驱动真实的管理台接口。它验的是单测覆盖不到的那部分：两条 query 串在经过真实 HTTP 客户端之后仍然一条含 `op_ticket=undefined`、一条不含；余额确实是从 `op_credit_summary.total_remaining_amount` 读的（含它发字符串这件事）；零积分账号真的会离开调度池、而读数过期后又会回来；国内站账号是被跳过而不是被发错协议；agent 侧初始化序列真的跑在领取**之前**；以及 `{agent_id}` 是从上游问回来的数字而不是角色名。
@@ -857,7 +1028,7 @@ python tools/signin_e2e.py --base http://127.0.0.1:8080 --password 你的密码
 加 `--recon` 还能顺手做一次**跨实现签名对照**——把服务实际发出去的请求喂给逆向工作区那份独立验证过 12/12 的 Python 签名器，两个实现算出同一个 `yy` 才算过：
 
 ```bash
-python tools/signin_e2e.py --password 你的密码 \
+python tools/signin_e2e.py --key 你的密钥 \
     --recon "C:/path/to/逆向minimax国际签到接口/code"
 ```
 
@@ -866,7 +1037,7 @@ python tools/signin_e2e.py --password 你的密码 \
 接口契约：
 
 ```bash
-python tools/contract.py --base http://127.0.0.1:8080 --password 你的密码
+python tools/contract.py --base http://127.0.0.1:8080 --key 你的密钥
 ```
 
 前端是编译产物，路由写错只会在浏览器里变成 404。这个脚本把控制台**实际会发的每一个请求**都重放一遍，只有 404/405 才算失败（400 是参数校验、401 是鉴权，都说明路由命中了）。改完任一侧的接口路径后跑一下，能立刻发现前后端对不上的地方。
@@ -874,7 +1045,7 @@ python tools/contract.py --base http://127.0.0.1:8080 --password 你的密码
 字段契约：
 
 ```bash
-python tools/fields.py --base http://127.0.0.1:8080 --password 你的密码
+python tools/fields.py --base http://127.0.0.1:8080 --key 你的密钥
 ```
 
 路由对了不代表字段对得上——后端漏掉或改了一个字段名，页面只会静默显示空白。这个脚本从前端 api 层的 `export type Xxx = {...}` 解析出每个 DTO 期望的字段，再拿真实响应逐字段核对。集合为空时自动降级为「前端 DTO vs Go struct 的 json tag」静态比对，保证覆盖率不打折。
@@ -898,7 +1069,7 @@ chrome --headless=new --disable-gpu --no-first-run --no-default-browser-check \
        --remote-debugging-port=9222 \
        --user-data-dir="C:\Users\你的用户名\AppData\Local\Temp\chrome-minimax" about:blank
 
-node tools/render.mjs http://127.0.0.1:8080 http://127.0.0.1:9222 你的密码
+node tools/render.mjs http://127.0.0.1:8080 http://127.0.0.1:9222 你的密钥
 ```
 
 > **Windows 上 `--user-data-dir` 必须写 Windows 路径**（如 `"C:\Users\你\AppData\Local\Temp\chrome-minimax"`）。传 `/tmp/...` 时 Chrome 会照常启动、日志一片空白，但**调试端口永远不会监听**，`curl http://127.0.0.1:9222/json/version` 一直连接被拒——看起来像端口被占，实际是路径没被认。另外本地回环请求记得加 `--noproxy '*'`，否则环境里的 `http_proxy` 会把它塞给代理，同样是连不上的假象。
@@ -1080,7 +1251,15 @@ agent 侧的初始化。不调它新号发消息会 500（报 `Environment Varia
 这是**适配器把上游的回显帧当成了回答**，不是模型在复述。上游为每条消息发两帧，其中 `role: "user"` 的那一帧装的就是网关刚发出去的整段拍平文本——人设和历史都在里面；结尾的完整重述帧还会让答案再说一遍。老版本只按键名找 `msg_content`、不看容器和角色，两帧都收了，所以症状是「整段输入原文 + 答案 + 答案」。现在按容器分流，回显帧直接丢掉。详见「上游把每条消息报了两遍」。
 
 **Q：带了 `tools` 请求，返回的却是普通文本，没有 `tool_calls`？**
-这是模拟层的正常降级，不是 bug。上游没有承载工具声明的字段，工具调用靠提示词约定加解析回复实现——模型没按格式作答时，解析就什么也拿不到。此时**正文原样返回**（不会丢内容），`finish_reason` 是 `stop` 而不是 `tool_calls`。想提高命中率可以简化工具描述、减少工具数量；但**别把它当可靠的控制流**，理由见「函数调用 → 该不该用」。
+先看 `upstream.mode`：
+- 是 `direct` → 那多半是**模型自己**决定不调用（它在回答里解释为什么），不是网关丢的。上游是原生 tool use，`finish_reason` 是 `stop` 就是模型真的没调。
+- 是 `agent`（默认）→ 这是模拟层的正常降级，不是 bug。上游没有承载工具声明的字段，工具调用靠提示词约定加解析回复实现——模型没按格式作答时，解析就什么也拿不到。此时**正文原样返回**（不会丢内容），`finish_reason` 是 `stop` 而不是 `tool_calls`。想提高命中率可以简化工具描述、减少工具数量；但**别把它当可靠的控制流**，理由见「函数调用 → 该不该用」。
+
+**Q：回复是流式的，但正文要等很久才一次性出现？**
+上游在客户端声明 `Accept-Encoding: gzip` 时会缓冲整个流（连响应头一起）。网关已经对流式请求写死 `Accept-Encoding: identity` 并把传输层压缩关掉；如果仍复现，先确认中间没有别的代理重新加上这个头。详见「上游有两条通道 → 一个反直觉的坑」。
+
+**Q：选了 minimax 模型，agent 里干活干不了，模型说「我跑在云端沙箱里，碰不到你电脑的桌面」？**
+这是 `agent` 通道的性质，不是配置问题：那条通道对面是 **MiniMax 自己的云端 Agent**，不是模型。把 `upstream.mode` 切成 `direct` 即可，详见「上游有两条通道」。
 
 **Q：Claude 客户端连上来，说模型不存在？**
 `/v1/messages` 不会因为模型名认不出来而报错，它会回落到默认对话模型。如果你在响应里看到 `model` 变成了 `minimax-agent`，说明客户端原来发的名字不在模型目录里。想让某个名字生效，在管理台的模型目录里建一个同名条目即可。

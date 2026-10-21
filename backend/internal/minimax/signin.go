@@ -396,6 +396,65 @@ func (c *Client) SigninClaim(ctx context.Context, cred Credential) (*SigninClaim
 	return claim, nil
 }
 
+// DebugSigninStatus re-issues the signed status GET and returns the untouched
+// envelope body. It exists for one-off diagnostics against the official
+// endpoint — cycle semantics, envelope fields parsePanel does not model — and
+// is exercised by the cmd/probe-signin tool, not by the gateway itself.
+func (c *Client) DebugSigninStatus(ctx context.Context, cred Credential) string {
+	settings := c.settings()
+	ctx, cancel := context.WithTimeout(ctx, signinTimeout(settings))
+	defer cancel()
+
+	path := strings.TrimSpace(settings.Signin.StatusPath)
+	if path == "" {
+		path = DefaultSigninStatusPath
+	}
+	payload, err := c.callSignin(ctx, settings, cred, http.MethodGet, path, "")
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	out, _ := json.MarshalIndent(payload, "", "  ")
+	return string(out)
+}
+
+// DefaultTokenRenewPath is the official frontend's own token-renewal endpoint
+// (POST, body "{}", current token in the `token` header). Found by reading the
+// site bundle (chunk 99384…): the axios 401 interceptor exempts exactly this
+// URL from its logout path, which is how the web client silently extends its
+// own session. Verified live 2026-10-16: the response carries a fresh JWT and
+// the old token keeps working — renewal is a resurface, not a rotation, so a
+// pool can renew every account a few days before expiry with zero downtime.
+const DefaultTokenRenewPath = "/v1/api/user/renewal"
+
+// RenewToken exchanges the account's current token for a fresh one.
+//
+// The endpoint answers `{data:{token}}` with a new 30-day JWT; the old token
+// is not invalidated (re-verified by repeated calls with the same credential),
+// which makes the exchange safe to schedule: a failed renewal leaves the old
+// token in force, and a renewal racing live traffic invalidates nothing. The
+// caller decides when to persist the result — the credential travels by value
+// here, so the store update belongs to whoever owns the account record.
+func (c *Client) RenewToken(ctx context.Context, cred Credential) (string, error) {
+	if strings.TrimSpace(cred.Token) == "" {
+		return "", ErrInvalidCredential
+	}
+	settings := c.settings()
+	ctx, cancel := context.WithTimeout(ctx, signinTimeout(settings))
+	defer cancel()
+
+	path := DefaultTokenRenewPath
+	payload, err := c.callSignin(ctx, settings, cred, http.MethodPost, path, "{}")
+	if err != nil {
+		return "", err
+	}
+	core, _ := payload["data"].(map[string]any)
+	token, _ := core["token"].(string)
+	if strings.TrimSpace(token) == "" {
+		return "", fmt.Errorf("renewal 响应中没有 token（status_code=%v）", payload["base_resp"])
+	}
+	return token, nil
+}
+
 // ------------------------------------------------------------------- credit
 
 // Credit reads the account's live credit balance.

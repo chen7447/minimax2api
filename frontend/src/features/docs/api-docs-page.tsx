@@ -64,6 +64,7 @@ data: [DONE]`,
   "object": "list",
   "data": [
     { "id": "minimax-agent", "object": "model", "owned_by": "minimax" },
+    { "id": "minimax-m3.1-flash", "object": "model", "owned_by": "minimax" },
     { "id": "minimax-m3.1-flash-preview", "object": "model", "owned_by": "minimax" },
     { "id": "minimax-m3", "object": "model", "owned_by": "minimax" },
     { "id": "minimax-m3-thinking", "object": "model", "owned_by": "minimax" },

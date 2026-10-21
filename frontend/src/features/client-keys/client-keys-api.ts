@@ -8,6 +8,7 @@ export type ClientKeyDTO = {
   enabled: boolean;
   rpmLimit: number;
   maxConcurrent: number;
+  pool?: string;
   totalRequests: number;
   createdAt: string;
   lastUsedAt: string;

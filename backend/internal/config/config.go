@@ -1,22 +1,28 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
 // Config holds process-level bootstrap options. Runtime-tunable gateway
 // parameters live in the persistent store instead.
 type Config struct {
-	Addr          string
-	DataDir       string
-	StaticDir     string
-	AdminUser     string
-	AdminPassword string
+	Addr      string
+	DataDir   string
+	StaticDir string
+	// AdminUser is a display label only. The console and the admin API are both
+	// gated by AdminKey alone — there is no username to type or to remember.
+	AdminUser string
+	AdminKey  string
 }
 
 func Load() Config {
@@ -24,12 +30,12 @@ func Load() Config {
 	flag.StringVar(&cfg.Addr, "addr", env("MINIMAX2API_ADDR", "127.0.0.1:8080"), "HTTP listen address")
 	flag.StringVar(&cfg.DataDir, "data", env("MINIMAX2API_DATA", "data"), "persistent data directory")
 	flag.StringVar(&cfg.StaticDir, "static", env("MINIMAX2API_STATIC", "frontend/dist"), "built frontend directory")
-	flag.StringVar(&cfg.AdminUser, "admin-user", env("MINIMAX2API_ADMIN_USER", "admin"), "initial admin username")
-	flag.StringVar(&cfg.AdminPassword, "admin-password", env("MINIMAX2API_ADMIN_PASSWORD", ""), "initial admin password (random when empty)")
+	flag.StringVar(&cfg.AdminUser, "admin-user", env("MINIMAX2API_ADMIN_USER", "admin"), "admin label (display only)")
+	flag.StringVar(&cfg.AdminKey, "admin-key", env("MINIMAX2API_ADMIN_KEY", ""), "initial admin key (random when empty)")
 	flag.Parse()
 
-	if cfg.AdminPassword == "" {
-		cfg.AdminPassword = env("MINIMAX2API_ADMIN_PASSWORD", "")
+	if cfg.AdminKey == "" {
+		cfg.AdminKey = env("MINIMAX2API_ADMIN_KEY", "")
 	}
 	return cfg
 }
@@ -96,11 +102,17 @@ type VideoSettings struct {
 // skipped rather than guessed at.
 type SigninSettings struct {
 	Enabled bool `json:"enabled"`
-	// Hour and Minute are local wall-clock time for the daily sweep. The
-	// upstream resets the day at some unverified boundary, so a morning run
-	// keeps a healthy margin on either interpretation.
+	// Hour and Minute are the pre-randomization fixed slot, kept only as the
+	// fallback for a store whose SlotSeed has not been issued yet. The console
+	// no longer edits them.
 	Hour   int `json:"hour"`
 	Minute int `json:"minute"`
+	// SlotSeed personalizes the randomized daily check-in slot. Issued once per
+	// install (the admin salt at first boot, an explicit random value when
+	// missing), it feeds SigninRandomSlot together with the Beijing date. It is
+	// not a secret in play — it only needs to be stable per deployment so
+	// restarts do not move today's slot.
+	SlotSeed string `json:"slotSeed"`
 	// GapSeconds spaces out the per-account requests. Check-in is a
 	// risk-control sensitive endpoint; a burst of parallel calls from one IP is
 	// exactly the pattern that gets accounts flagged.
@@ -161,6 +173,25 @@ type UpstreamSettings struct {
 	AgentID     string `json:"agentID"`
 	SessionPath string `json:"sessionPath"`
 	MessagePath string `json:"messagePath"`
+	// Mode selects which upstream transport chat turns use.
+	//
+	//   - `agent`  — the agent conversation endpoint (session + message). This is
+	//     what the gateway has always used, and the only transport that can reach
+	//     the video and image plugin routes.
+	//   - `direct` — the model endpoint the official client uses for model turns
+	//     (`/mavis/api/v1/llm/v1/messages`). Anthropic Messages, native tool use,
+	//     no session, no echo.
+	//
+	// The two are not interchangeable, and the difference is not one of quality:
+	// the agent endpoint answers as MiniMax's own cloud agent — its own persona,
+	// its own sandbox, its own memory — and has no field that could carry a tool
+	// declaration. A client that wants to drive a tool loop (Claude Code, ZCode
+	// and the like) needs `direct`. See internal/minimax/direct.go.
+	Mode string `json:"mode"`
+	// ModelPath is where one turn is posted on the direct transport.
+	ModelPath string `json:"modelPath"`
+	// ModelsPath lists the model ids the direct transport accepts.
+	ModelsPath string `json:"modelsPath"`
 	// UserInfoPath is where an account's realUserID can be read. Every signed
 	// endpoint demands that value in its query and answers a bare 401 without
 	// it, and it appears nowhere in the token — so this call is the only way an
@@ -187,7 +218,15 @@ type UpstreamSettings struct {
 	SummariesPath string `json:"summariesPath"`
 	// DriveFilePath addresses one drive node. Its `download-url` sub-resource is
 	// what turns a node into a playable link.
-	DriveFilePath        string `json:"driveFilePath"`
+	DriveFilePath string `json:"driveFilePath"`
+	// UploadsPath mints a private upload policy for an attachment.
+	//
+	// The message endpoint only accepts an image the account owns, so an image
+	// has to be uploaded before it can be attached, and this is where that
+	// starts. It is a setting for the same reason as the other paths: it belongs
+	// to the upstream bundle, and a rename should be an edit rather than a
+	// rebuild.
+	UploadsPath          string `json:"uploadsPath"`
 	ModelPayload         string `json:"modelPayload"`
 	Language             string `json:"language"`
 	ScreenWidth          int    `json:"screenWidth"`
@@ -219,6 +258,19 @@ type RoutingSettings struct {
 	CapacityWaitSec int    `json:"capacityWaitSec"`
 	StickyTTLSec    int    `json:"stickyTTLSec"`
 	PreferIdle      bool   `json:"preferIdle"`
+	// ActivePoolSize is the number of accounts kept in the working set the
+	// scheduler draws from ("使用池"). The working set prefers the session's
+	// current account, evicts an account the moment upstream reports its
+	// balance spent, and backfills from the reserve with the highest known
+	// credit (ties broken randomly). Keeping it small concentrates traffic on a
+	// few accounts so the rest of the pool keeps both its balances and its
+	// risk-control footprint untouched. 0 schedules across the whole pool.
+	ActivePoolSize int `json:"activePoolSize"`
+	// ExhaustedRetryHours is how long an exhausted account waits before the
+	// background sweep re-runs its check-in on a per-account clock. Any credit
+	// reading above zero revives the account immediately; this is the fallback
+	// for accounts whose daily check-in failed. 0 disables the retry.
+	ExhaustedRetryHours int `json:"exhaustedRetryHours"`
 }
 
 type AuditSettings struct {
@@ -262,6 +314,14 @@ const (
 	legacyDefaultMessagePath = "/archon/api/v1/session/{session_id}/message"
 )
 
+// Upstream transport modes. See UpstreamSettings.Mode for what each one means.
+const (
+	// ModeAgent is the agent conversation endpoint.
+	ModeAgent = "agent"
+	// ModeDirect is the model endpoint the official client uses for model turns.
+	ModeDirect = "direct"
+)
+
 // DefaultSettings returns the built-in runtime configuration.
 func DefaultSettings(dataDir string) Settings {
 	return Settings{
@@ -280,14 +340,25 @@ func DefaultSettings(dataDir string) Settings {
 			// Must agree with minimax.DefaultSessionPath — this package cannot
 			// import it (the dependency runs the other way), so the agreement is
 			// pinned by a test in the minimax package instead.
-			SessionPath:          "/minimax-cloud/api/v1/agent/{agent_id}/session",
-			MessagePath:          "/minimax-cloud/api/v1/session/{session_id}/message",
-			UserInfoPath:         "/v1/api/user/info",
-			AgentListPath:        "/minimax-cloud/api/v1/agent",
-			ConfigPath:           "/minimax-cloud/api/v1/config",
-			ConnectionsPath:      "/minimax-cloud/api/v1/channel/connections",
-			SummariesPath:        "/minimax-cloud/api/v1/session/{session_id}/input-summaries",
-			DriveFilePath:        "/minimax-cloud/api/v1/drive/file/{node_id}",
+			SessionPath: "/minimax-cloud/api/v1/agent/{agent_id}/session",
+			MessagePath: "/minimax-cloud/api/v1/session/{session_id}/message",
+			// The agent transport stays the default. Switching it is a deliberate
+			// act — the direct transport is the better one for tool-calling
+			// clients, but it is a different protocol and an install that is
+			// happily serving chat should not be moved onto it by an upgrade.
+			Mode:            ModeAgent,
+			ModelPath:       "/mavis/api/v1/llm/v1/messages",
+			ModelsPath:      "/mavis/api/v1/models",
+			UserInfoPath:    "/v1/api/user/info",
+			AgentListPath:   "/minimax-cloud/api/v1/agent",
+			ConfigPath:      "/minimax-cloud/api/v1/config",
+			ConnectionsPath: "/minimax-cloud/api/v1/channel/connections",
+			SummariesPath:   "/minimax-cloud/api/v1/session/{session_id}/input-summaries",
+			DriveFilePath:   "/minimax-cloud/api/v1/drive/file/{node_id}",
+			// Must agree with minimax.DefaultUploadsPath — this package cannot
+			// import it (the dependency runs the other way), so the agreement is
+			// pinned by a test in the minimax package instead.
+			UploadsPath:          "/minimax-cloud/api/v1/uploads/prepare",
 			ModelPayload:         "",
 			Language:             "zh-CN,zh;q=0.9,en;q=0.8",
 			ScreenWidth:          1920,
@@ -298,13 +369,15 @@ func DefaultSettings(dataDir string) Settings {
 			UserAgent:            defaultUserAgent,
 		},
 		Routing: RoutingSettings{
-			Strategy:        "least_inflight",
-			CooldownBaseSec: 60,
-			CooldownMaxSec:  900,
-			MaxAttempts:     3,
-			CapacityWaitSec: 20,
-			StickyTTLSec:    300,
-			PreferIdle:      true,
+			Strategy:            "least_inflight",
+			CooldownBaseSec:     60,
+			CooldownMaxSec:      900,
+			MaxAttempts:         3,
+			CapacityWaitSec:     20,
+			StickyTTLSec:        300,
+			PreferIdle:          true,
+			ActivePoolSize:      3,
+			ExhaustedRetryHours: 24,
 		},
 		Audit: AuditSettings{
 			RetentionDays:  7,
@@ -410,6 +483,23 @@ func (s *Settings) Normalize(dataDir string) bool {
 	if s.Upstream.MessagePath == legacyDefaultMessagePath {
 		s.Upstream.MessagePath = def.Upstream.MessagePath
 	}
+	// Mode is repaired rather than honoured when unrecognised. An empty value is
+	// what a settings file written before this field existed carries, and it is
+	// also what a console save that does not know the field would send — so the
+	// safe reading of "no value" is "the transport this install already used",
+	// not "guess". See UpstreamSettings.Mode.
+	switch strings.ToLower(strings.TrimSpace(s.Upstream.Mode)) {
+	case ModeDirect:
+		s.Upstream.Mode = ModeDirect
+	default:
+		s.Upstream.Mode = ModeAgent
+	}
+	if s.Upstream.ModelPath == "" {
+		s.Upstream.ModelPath = def.Upstream.ModelPath
+	}
+	if s.Upstream.ModelsPath == "" {
+		s.Upstream.ModelsPath = def.Upstream.ModelsPath
+	}
 	if s.Upstream.UserInfoPath == "" {
 		s.Upstream.UserInfoPath = def.Upstream.UserInfoPath
 	}
@@ -427,6 +517,9 @@ func (s *Settings) Normalize(dataDir string) bool {
 	}
 	if s.Upstream.DriveFilePath == "" {
 		s.Upstream.DriveFilePath = def.Upstream.DriveFilePath
+	}
+	if s.Upstream.UploadsPath == "" {
+		s.Upstream.UploadsPath = def.Upstream.UploadsPath
 	}
 	if s.Upstream.ScreenWidth <= 0 {
 		s.Upstream.ScreenWidth = def.Upstream.ScreenWidth
@@ -465,6 +558,12 @@ func (s *Settings) Normalize(dataDir string) bool {
 	}
 	if s.Routing.StickyTTLSec < 0 {
 		s.Routing.StickyTTLSec = def.Routing.StickyTTLSec
+	}
+	if s.Routing.ActivePoolSize < 0 || s.Routing.ActivePoolSize > 64 {
+		s.Routing.ActivePoolSize = def.Routing.ActivePoolSize
+	}
+	if s.Routing.ExhaustedRetryHours < 0 || s.Routing.ExhaustedRetryHours > 24*30 {
+		s.Routing.ExhaustedRetryHours = def.Routing.ExhaustedRetryHours
 	}
 	if s.Audit.MaxRecords < 100 {
 		s.Audit.MaxRecords = def.Audit.MaxRecords
@@ -580,6 +679,17 @@ func (s Settings) StreamIdleTimeout() time.Duration {
 	return time.Duration(s.Upstream.StreamIdleTimeoutSec) * time.Second
 }
 
+// UsesDirectModelAPI reports whether chat turns go to the model endpoint rather
+// than the agent conversation endpoint.
+//
+// It is deliberately tolerant of the stored value rather than trusting
+// Normalize to have run: a settings snapshot can be handed around before it is
+// repaired, and reading "Direct" or " direct " as the agent transport would be
+// a silent downgrade of exactly the thing this setting exists to select.
+func (s Settings) UsesDirectModelAPI() bool {
+	return strings.EqualFold(strings.TrimSpace(s.Upstream.Mode), ModeDirect)
+}
+
 // VideoTimeout bounds one video-generation turn.
 //
 // It is a separate budget from RequestTimeout because the two have nothing in
@@ -605,6 +715,18 @@ func (s Settings) StickyTTL() time.Duration {
 	return time.Duration(s.Routing.StickyTTLSec) * time.Second
 }
 
+// ActivePoolSize is the working-set size the scheduler draws from; 0 keeps the
+// legacy whole-pool scheduling.
+func (s Settings) ActivePoolSize() int {
+	return s.Routing.ActivePoolSize
+}
+
+// ExhaustedRetry is how long an exhausted account waits before its check-in is
+// retried in the background; 0 disables the retry.
+func (s Settings) ExhaustedRetry() time.Duration {
+	return time.Duration(s.Routing.ExhaustedRetryHours) * time.Hour
+}
+
 func (s Settings) Retention() time.Duration {
 	return time.Duration(s.Audit.RetentionDays) * 24 * time.Hour
 }
@@ -615,8 +737,72 @@ func (s Settings) MediaLimitBytes() int64 {
 
 // SigninClock is the configured local wall-clock time for the daily sweep,
 // expressed as an offset from midnight.
+//
+// Historical field: since the randomized slot (SigninRandomSlot) it is only a
+// fallback for installs that predate the feature, and is no longer surfaced in
+// the console.
 func (s Settings) SigninClock() time.Duration {
 	return time.Duration(s.Signin.Hour)*time.Hour + time.Duration(s.Signin.Minute)*time.Minute
+}
+
+// signinSlotWindowMin is the earliest minute of the Beijing day a randomized
+// slot may land on, and signinSlotSpanMin is how many minutes the window spans.
+//
+// The window is 08:00–24:00 Beijing rather than the full 24 hours, for two
+// reasons that both trace back to how the upstream accounts days. The streak
+// and the seven-day board are day-shaped, and the upstream's day boundary is
+// almost certainly Beijing midnight (check-in requests carry
+// timezone_offset=480) or possibly UTC midnight. A slot uniform over 00:00–
+// 24:00 local can put two of this schedule's slots inside one upstream day
+// whenever the two midnights disagree, which signs into the wrong day: the
+// claim burns the day's slot, reports success, and pays nothing — invisible,
+// permanent, and hitting roughly every fifth day at worst. Anchoring slots to
+// the Beijing calendar day with an 8-hour margin before local midnight makes
+// that impossible for both candidate boundaries. It also reads human: nobody
+// checks in at 03:47, and a check-in timestamp at that hour is the kind of
+// fingerprint that uniform randomness invites.
+const (
+	signinSlotWindowMin = 8 * 60
+	signinSlotSpanMin   = 16 * 60
+)
+
+// SigninRandomSlot derives the check-in instant for the Beijing calendar day
+// containing t, as an offset from that day's midnight.
+//
+// Deterministic on purpose: hash(stable-seed, Beijing-date) → one minute in the
+// day's window. Every restart, every NextRun call and the guard timer all
+// derive the same instant for a given day, so the schedule survives reboots —
+// but the instant differs day to day and is not guessable in advance, which is
+// the point: a fixed 09:05 sweep is a pattern, and this is not.
+//
+// The seed is the admin salt, which already exists on every install, is
+// regenerated only when the key is reset, and never leaves the store — a
+// fingerprint of this deployment, not a secret in play. When the salt is empty
+// (unreadable store, tests) the empty string still hashes; only the
+// determinism-per-install is lost, never correctness.
+func (s Settings) SigninRandomSlot(t time.Time) time.Duration {
+	beijing := t.In(BeijingZone())
+	seed := fmt.Sprintf("signin-slot|%s|%04d-%02d-%02d",
+		s.Signin.SlotSeed, beijing.Year(), beijing.Month(), beijing.Day())
+	sum := sha256.Sum256([]byte(seed))
+	offset := int(binary.BigEndian.Uint64(sum[:8]) % uint64(signinSlotSpanMin))
+	return time.Duration(signinSlotWindowMin+offset) * time.Minute
+}
+
+// BeijingZone is Asia/Shanghai, looked up once. It is the reference frame for
+// the randomized check-in slot: the pool is international-only, but the
+// operator and the upstream's likely day boundary both live in this zone, and
+// a slot computed in whatever zone the VPS happens to run would change meaning
+// on a server move.
+func BeijingZone() *time.Location {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		// An embedded tz database should always resolve; fall back to a fixed
+		// UTC+8 rather than guessing from the host zone, so the slot semantics
+		// survive even a stripped-down container.
+		return time.FixedZone("CST+8", 8*60*60)
+	}
+	return loc
 }
 
 // SigninGap is the pause between two accounts during a sweep.

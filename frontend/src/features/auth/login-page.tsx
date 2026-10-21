@@ -12,23 +12,18 @@ export function LoginPage() {
   const { t } = useTranslation();
   const { login } = useAuth();
   const navigate = useNavigate();
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
+  const [key, setKey] = useState("");
   const [busy, setBusy] = useState(false);
 
   async function submit(event: React.FormEvent): Promise<void> {
     event.preventDefault();
-    if (!username.trim()) {
-      toast.error(t("auth.usernameRequired"));
-      return;
-    }
-    if (!password) {
-      toast.error(t("auth.passwordRequired"));
+    if (!key.trim()) {
+      toast.error(t("auth.keyRequired"));
       return;
     }
     setBusy(true);
     try {
-      await login(username.trim(), password);
+      await login(key.trim());
       navigate("/dashboard", { replace: true });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : t("errors.generic"));
@@ -61,25 +56,15 @@ export function LoginPage() {
             </div>
             <form className="space-y-4" onSubmit={submit}>
               <div className="space-y-2">
-                <Label htmlFor="username">{t("auth.username")}</Label>
+                <Label htmlFor="key">{t("auth.key")}</Label>
                 <Input
-                  id="username"
-                  className="h-9 bg-card"
-                  autoComplete="username"
-                  autoFocus
-                  value={username}
-                  onChange={(event) => setUsername(event.target.value)}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="password">{t("auth.password")}</Label>
-                <Input
-                  id="password"
+                  id="key"
                   className="h-9 bg-card"
                   type="password"
                   autoComplete="current-password"
-                  value={password}
-                  onChange={(event) => setPassword(event.target.value)}
+                  autoFocus
+                  value={key}
+                  onChange={(event) => setKey(event.target.value)}
                 />
               </div>
               <Button type="submit" size="sm" className="w-full" disabled={busy}>

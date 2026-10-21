@@ -10,6 +10,8 @@ package signin
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -35,6 +37,9 @@ type Client interface {
 	// CreditGrants reads the per-grant breakdown, which is the only evidence
 	// that a claimed payout was actually issued.
 	CreditGrants(ctx context.Context, cred minimax.Credential) ([]minimax.CreditGrant, error)
+	// RenewToken exchanges the account's current token for a fresh 30-day JWT.
+	// The old token stays valid, so a failed renewal costs nothing but a retry.
+	RenewToken(ctx context.Context, cred minimax.Credential) (string, error)
 }
 
 // AccountResult is one account's outcome within a sweep.
@@ -67,24 +72,139 @@ type Service struct {
 	client   Client
 	settings func() config.Settings
 	credOf   func(*store.Account) minimax.Credential
+	// slotSeed personalizes the randomized daily slot; empty falls back to the
+	// legacy fixed clock. Set once at construction, see New.
+	slotSeed string
+
+	// queue carries ids of freshly added accounts waiting for their first
+	// check-in. Buffered, and dropped on overflow: the daily sweep is the
+	// backstop, so losing a queued id only delays that account to tomorrow.
+	queue chan string
 
 	mu      sync.Mutex
 	running bool
 	last    *Report
 	lastAt  time.Time
+
+	// Renewal pass state: claimed by both the timed loop and the console's
+	// pool-wide button so they cannot stampede the renewal endpoint together.
+	renewMu      sync.Mutex
+	renewRunning bool
 }
 
 // New builds a Service. credOf converts a stored account into the credential
 // the upstream client expects; it is injected so this package does not have to
-// import the gateway.
+// import the gateway. slotSeed is the per-install value that scatters the daily
+// slot; empty keeps the legacy fixed schedule.
 func New(st *store.Store, client Client, settings func() config.Settings, credOf func(*store.Account) minimax.Credential) *Service {
-	return &Service{store: st, client: client, settings: settings, credOf: credOf}
+	return &Service{
+		store: st, client: client, settings: settings, credOf: credOf,
+		slotSeed: st.SigninSlotSeed(),
+		queue:    make(chan string, 512),
+	}
 }
 
 // Start launches the background loops. They stop when ctx is cancelled.
 func (s *Service) Start(ctx context.Context) {
 	go s.loop(ctx)
 	go s.creditLoop(ctx)
+	go s.queueLoop(ctx)
+	go s.exhaustedLoop(ctx)
+	go s.renewLoop(ctx)
+}
+
+// Enqueue asks for one account's check-in as soon as the worker reaches it.
+//
+// The daily sweep covers only the accounts that exist when it runs, and once
+// anything was swept today the scheduler moves straight to tomorrow's slot —
+// so an account added afterwards would otherwise sit unsigned until the next
+// morning. Every path that puts an account into the pool (manual add, bulk
+// import, credential capture) calls this right after the write succeeds.
+//
+// It is safe to enqueue the same account twice: the second pass reads as
+// "already claimed" upstream and costs one status read. A full queue drops the
+// request rather than blocking the console request that captured the account.
+func (s *Service) Enqueue(id string) {
+	select {
+	case s.queue <- id:
+	default:
+		log.Printf("自动签到队列已满，账号 %s 留待下次全量签到", id)
+	}
+}
+
+// queueLoop serves the enqueue requests one at a time, with the same spacing
+// as a sweep: the check-in endpoints sit behind the same risk control whether
+// the trigger was the clock or a fresh capture.
+func (s *Service) queueLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case id := <-s.queue:
+			// Re-read inside the loop so flipping the switch in the console
+			// takes effect without a restart, matching creditLoop.
+			if !s.settings().Signin.Enabled {
+				continue
+			}
+			if !s.waitForIdentity(ctx, id) {
+				return
+			}
+			result, err := s.CheckOne(ctx, id)
+			if err != nil {
+				// Deleted between enqueue and here; nothing left to sign.
+				continue
+			}
+			log.Printf("新号自动签到 %s：%s", result.Name, signinResultSummary(result))
+			if !sleep(ctx, s.settings().SigninGap()) {
+				return
+			}
+		}
+	}
+}
+
+// waitForIdentity gives the account's asynchronous preparation a short window
+// before the check-in is attempted.
+//
+// Every entry path kicks off prepareAccount in the background, and that call
+// is what discovers user_id — a value the token does not carry and a check-in
+// cannot run without. Signing immediately after the add therefore records a
+// skip ("缺少 user_id") that the daily sweep would have to redo the next
+// morning, when the identity had been sitting there all along. Discovery
+// usually lands within a couple of seconds, so waiting is cheap; the wait
+// ends early for accounts that will be skipped regardless (disabled, non-
+// global) and after the deadline for accounts whose preparation failed, which
+// the attempt then reports honestly.
+func (s *Service) waitForIdentity(ctx context.Context, id string) bool {
+	const identityWait = 15 * time.Second
+	deadline := time.Now().Add(identityWait)
+	for {
+		account, ok := s.store.AccountByID(id)
+		ready := !ok || // deleted; let CheckOne answer "账号不存在"
+			!account.Enabled ||
+			account.Region != store.RegionGlobal ||
+			(account.UserID != "" && account.UserID != "0") ||
+			!time.Now().Before(deadline)
+		if ready {
+			return true
+		}
+		if !sleep(ctx, time.Second) {
+			return false
+		}
+	}
+}
+
+// signinResultSummary renders one account outcome for the log line.
+func signinResultSummary(result AccountResult) string {
+	switch result.Status {
+	case store.SigninOK:
+		return fmt.Sprintf("新领 %d 积分", result.Points)
+	case store.SigninAlready:
+		return "今日已领"
+	case store.SigninSkipped:
+		return "跳过：" + result.Error
+	default:
+		return "失败：" + result.Error
+	}
 }
 
 // LastReport returns the most recent sweep, if any.
@@ -110,10 +230,20 @@ func (s *Service) Running() bool {
 
 // ------------------------------------------------------------------ schedule
 
-// slotOn is the configured check-in instant on the calendar day containing t.
+// slotOn is the check-in instant on the calendar day containing t.
+//
+// The slot is randomized per day (see SigninRandomSlot) once the deployment has
+// a slot seed, and falls back to the legacy fixed hour:minute for stores that
+// predate the seed. In both shapes the result is anchored to the Beijing day:
+// the randomized window intentionally stops short of Beijing midnight so two
+// slots can never land inside one upstream day (the upstream's day boundary is
+// what the streak is booked against).
 func (s *Service) slotOn(t time.Time) time.Time {
-	midnight := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
-	return midnight.Add(s.settings().SigninClock())
+	midnight := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, config.BeijingZone())
+	if s.slotSeed == "" {
+		return midnight.Add(s.settings().SigninClock())
+	}
+	return midnight.Add(s.settings().SigninRandomSlot(t))
 }
 
 // NextRun is the next instant the sweep should fire.
@@ -121,34 +251,41 @@ func (s *Service) slotOn(t time.Time) time.Time {
 // A slot that has already passed but was never served is due immediately rather
 // than skipped. Without that, a machine that was asleep at the scheduled minute
 // would silently miss the day, and a check-in tool that misses days is not worth
-// scheduling.
+// scheduling. This is what makes the randomized slot safe: whenever the process
+// starts after today's slot — a reboot, a swap-stall, anything — the sweep runs
+// the moment the scheduler ticks.
 func (s *Service) NextRun(now time.Time) time.Time {
 	slot := s.slotOn(now)
-	if now.Before(slot) {
-		return slot
-	}
+	// The served day is checked before the "slot still ahead" branch: a day
+	// swept early — a catch-up on startup, a manual run from the console — must
+	// not be swept a second time at the drawn slot. Consulting the slot first
+	// would do exactly that for any restart that lands before it.
 	if s.sweptOn(now) {
 		return slot.Add(24 * time.Hour)
+	}
+	if now.Before(slot) {
+		return slot
 	}
 	return now
 }
 
-// sweptOn reports whether any account records a check-in attempt on the
-// calendar day containing t. Deriving it from the account records avoids a
-// second piece of persisted state that could disagree with them.
+// sweptOn reports whether the daily sweep served the calendar day containing t.
+//
+// The store's SigninSweptAt — stamped only after a completed walk of the pool —
+// is the sole authority. Per-account markers cannot do this job: the enqueue
+// worker stamps SigninAt for freshly added accounts at any hour, so "someone
+// signed in today" is not "the pool was swept today". Reading the wrong signal
+// here is exactly how a pool of 382 goes unsigned: the day reads served off one
+// fresh account's queue check-in and the real sweep skips to tomorrow.
 func (s *Service) sweptOn(t time.Time) bool {
-	year, month, day := t.Date()
-	for _, account := range s.store.ListAccounts() {
-		if account.SigninAt.IsZero() {
-			continue
-		}
-		local := account.SigninAt.In(t.Location())
-		accountYear, accountMonth, accountDay := local.Date()
-		if accountYear == year && accountMonth == month && accountDay == day {
-			return true
-		}
+	swept := s.store.SigninSweptAt()
+	if swept.IsZero() {
+		return false
 	}
-	return false
+	year, month, day := t.In(config.BeijingZone()).Date()
+	local := swept.In(config.BeijingZone())
+	sy, sm, sd := local.Date()
+	return sy == year && sm == month && sd == day
 }
 
 func (s *Service) loop(ctx context.Context) {
@@ -156,6 +293,13 @@ func (s *Service) loop(ctx context.Context) {
 		next := s.NextRun(time.Now())
 		if !sleep(ctx, time.Until(next)) {
 			return
+		}
+		// The tick that woke can predate a switch flip: the operator may have
+		// disabled sign-ins between scheduling this wake-up and now. Re-checking
+		// here keeps the off switch honest instead of honouring it only for the
+		// queue, credit and exhausted loops.
+		if !s.settings().Signin.Enabled {
+			continue
 		}
 		s.Sweep(ctx)
 		// Move straight to tomorrow's slot. Recomputing from NextRun would spin
@@ -215,8 +359,14 @@ func (s *Service) Sweep(ctx context.Context) *Report {
 	accounts := s.store.ListAccounts()
 	gap := s.settings().SigninGap()
 
+	completed := true
 	for index, account := range accounts {
 		if ctx.Err() != nil {
+			// A cancelled walk leaves the day unserved on purpose: the stamp is
+			// only written for a sweep that reached the end of the pool, so an
+			// interrupted run is retried by the next tick rather than recorded
+			// as done with half the pool behind it.
+			completed = false
 			break
 		}
 		result := s.checkAccount(ctx, account)
@@ -235,12 +385,25 @@ func (s *Service) Sweep(ctx context.Context) *Report {
 		report.Results = append(report.Results, result)
 		if index < len(accounts)-1 && gap > 0 {
 			if !sleep(ctx, gap) {
+				completed = false
 				break
 			}
 		}
 	}
 	log.Printf("签到完成：共 %d，新领 %d，已领 %d，失败 %d，跳过 %d，本次积分 %d",
 		report.Total, report.Claimed, report.Already, report.Failed, report.Skipped, report.Points)
+	// A completed walk consumes the day, whichever trigger set it going — the
+	// scheduled slot, the console button, the guard timer: they all walk the
+	// same pool, so letting the scheduler re-run the slot after a manual sweep
+	// would only replay 382 "already claimed" reads against the risk control.
+	// Failed accounts are still consumed: their retry paths (exhausted loop,
+	// next day's slot) are the designed remedy, not an immediate re-sweep.
+	// Stamp the wall clock here, not report.EndedAt — that field is written by
+	// the deferred finalizer, i.e. after this line, and stamping it now would
+	// persist the zero time and make the day read unserved forever.
+	if completed {
+		s.store.MarkSigninSwept(time.Now())
+	}
 	return report
 }
 
@@ -569,17 +732,42 @@ func (s *Service) refreshCredit(ctx context.Context, account *store.Account) int
 	callCtx, cancel := context.WithTimeout(ctx, s.settings().SigninTimeout())
 	defer cancel()
 
-	info, err := s.client.Credit(callCtx, s.credOf(account))
+	cred := s.credOf(account)
+	info, err := s.client.Credit(callCtx, cred)
 	if err != nil {
 		return -1
 	}
+	// The per-grant breakdown rides the same poller pass. One more request
+	// inside the existing risk-control spacing beats a second walk of the
+	// pool; a failure here must not discard the fresh balance above.
+	grants, grantErr := s.client.CreditGrants(callCtx, cred)
 	s.record(account.ID, func(target *store.Account) {
-		target.Credit = &store.Credit{
-			Total: info.Total, Free: info.Free, Purchased: info.Purchased,
-			PlanName: info.PlanName, PlanType: info.PlanType, SyncedAt: time.Now(),
+		applyCredit(target, info)
+		if grantErr == nil {
+			target.Grants = grantsOf(grants)
+			target.GrantsSyncedAt = time.Now()
 		}
 	})
 	return info.Total
+}
+
+// applyCredit stores a fresh balance and revives an exhausted account whose
+// balance came back. This is the credit-activation recovery: an exhausted
+// account carries no recovery clock of its own, so any reading above zero —
+// check-in payout, top-up, manual refresh — puts it back into the reserve,
+// from which the working set pulls it when it ranks highest.
+func applyCredit(target *store.Account, info *minimax.CreditInfo) {
+	target.Credit = &store.Credit{
+		Total: info.Total, Free: info.Free, Purchased: info.Purchased,
+		PlanName: info.PlanName, PlanType: info.PlanType, SyncedAt: time.Now(),
+	}
+	if info.Total > 0 && target.Status == store.StatusExhausted {
+		target.Status = store.StatusActive
+		target.ExhaustedAt = time.Time{}
+		target.CooldownUntil = time.Time{}
+		target.LastError = ""
+		log.Printf("账号 %s 额度到账（%d），自动恢复使用", target.Name, info.Total)
+	}
 }
 
 // RefreshCredit is the console's manual balance refresh.
@@ -595,16 +783,67 @@ func (s *Service) RefreshCredit(ctx context.Context, id string) (*store.Credit, 
 	callCtx, cancel := context.WithTimeout(ctx, s.settings().SigninTimeout())
 	defer cancel()
 
-	info, err := s.client.Credit(callCtx, s.credOf(account))
+	cred := s.credOf(account)
+	info, err := s.client.Credit(callCtx, cred)
 	if err != nil {
 		return nil, err
 	}
-	credit := &store.Credit{
+	// Same deal as the background poller: the breakdown rides along, but its
+	// failure does not sink the balance update.
+	grants, grantErr := s.client.CreditGrants(callCtx, cred)
+	s.record(id, func(target *store.Account) {
+		applyCredit(target, info)
+		if grantErr == nil {
+			target.Grants = grantsOf(grants)
+			target.GrantsSyncedAt = time.Now()
+		}
+	})
+	return &store.Credit{
 		Total: info.Total, Free: info.Free, Purchased: info.Purchased,
 		PlanName: info.PlanName, PlanType: info.PlanType, SyncedAt: time.Now(),
+	}, nil
+}
+
+// grantsOf converts upstream grants into their stored shape. Upstream amounts
+// are floats; they travel unchanged. A nil result is stored as an empty slice
+// so a legitimately empty breakdown does not read as "never fetched" — that
+// distinction is GrantsSyncedAt's job.
+func grantsOf(grants []minimax.CreditGrant) []store.CreditGrant {
+	out := make([]store.CreditGrant, 0, len(grants))
+	for _, grant := range grants {
+		out = append(out, store.CreditGrant{
+			GrantedAt: grant.GrantedAt, ExpiresAt: grant.ExpiresAt,
+			Granted: grant.Granted, Remaining: grant.Remaining,
+		})
 	}
-	s.record(id, func(target *store.Account) { target.Credit = credit })
-	return credit, nil
+	return out
+}
+
+// RefreshGrants re-reads only the per-grant breakdown for one account — the
+// console's per-account sync on the credit panel. It skips the balance call:
+// a breakdown without a fresh balance is fine there, and it keeps a manual
+// click to two upstream requests instead of three.
+func (s *Service) RefreshGrants(ctx context.Context, id string) ([]store.CreditGrant, error) {
+	account, ok := s.store.AccountByID(id)
+	if !ok {
+		return nil, errors.New("账号不存在")
+	}
+	if account.Region != store.RegionGlobal {
+		return nil, errors.New("积分明细接口仅支持国际站账号")
+	}
+	callCtx, cancel := context.WithTimeout(ctx, s.settings().SigninTimeout())
+	defer cancel()
+
+	grants, err := s.client.CreditGrants(callCtx, s.credOf(account))
+	if err != nil {
+		return nil, err
+	}
+	stored := grantsOf(grants)
+	s.record(id, func(target *store.Account) {
+		target.Grants = stored
+		target.GrantsSyncedAt = time.Now()
+	})
+	return stored, nil
 }
 
 // creditLoop keeps the stored balances warm so the routing guard has something
@@ -620,8 +859,16 @@ func (s *Service) creditLoop(ctx context.Context) {
 			}
 			continue
 		}
-		if !sleep(ctx, interval) {
-			return
+		// Cold start: a pool where no account has a grant breakdown yet (first
+		// run of the credit panel, or a freshly imported pool) walks right away
+		// instead of idling a full interval — the panel would otherwise sit at
+		// "未同步" for up to 30 minutes after every deploy that reset the data.
+		// Steady-state restarts keep the sleep-first rhythm: grants survive the
+		// restart on disk, so nothing justifies re-hitting upstream immediately.
+		if !grantsColdStart(s.store.ListAccounts()) {
+			if !sleep(ctx, interval) {
+				return
+			}
 		}
 		if !s.settings().Signin.Enabled {
 			continue
@@ -641,9 +888,262 @@ func (s *Service) creditLoop(ctx context.Context) {
 	}
 }
 
+// grantsColdStart reports whether no account carries a grant breakdown yet.
+func grantsColdStart(accounts []*store.Account) bool {
+	for _, account := range accounts {
+		if !account.GrantsSyncedAt.IsZero() {
+			return false
+		}
+	}
+	return len(accounts) > 0
+}
+
+// exhaustedLoop is the failed-check-in safety net for exhausted accounts.
+//
+// The daily sweep already re-runs every account's check-in, but it marks the
+// day as served even when a claim errors, so an exhausted account whose sweep
+// failed would sit at zero until the next sweep — and succeed or fail again on
+// the same wall clock forever. Each exhausted account therefore carries its
+// own retry clock (ExhaustedAt): once it has been exhausted for
+// ExhaustedRetryHours its check-in runs again here. A payout revives it via
+// applyCredit; a flat balance keeps it exhausted and resets the clock for the
+// next attempt.
+func (s *Service) exhaustedLoop(ctx context.Context) {
+	for {
+		if !sleep(ctx, 30*time.Minute) {
+			return
+		}
+		if !s.settings().Signin.Enabled {
+			continue
+		}
+		retry := s.settings().ExhaustedRetry()
+		if retry <= 0 {
+			continue
+		}
+		now := time.Now()
+		for _, account := range s.store.ListAccounts() {
+			if ctx.Err() != nil {
+				return
+			}
+			if account.Status != store.StatusExhausted || account.ExhaustedAt.IsZero() {
+				continue
+			}
+			if now.Sub(account.ExhaustedAt) < retry {
+				continue
+			}
+			if s.Running() {
+				// A full sweep is in flight and will reach this account on
+				// its own; running both would double-hit the claim endpoint.
+				break
+			}
+			log.Printf("账号 %s 已耗尽超过 %s，自动重试签到", account.Name, retry)
+			if _, err := s.CheckOne(ctx, account.ID); err != nil {
+				log.Printf("账号 %s 耗尽重试签到失败：%v", account.Name, err)
+			}
+			s.record(account.ID, func(target *store.Account) {
+				if target.Status == store.StatusExhausted {
+					target.ExhaustedAt = time.Now()
+				}
+			})
+			if !sleep(ctx, s.settings().SigninGap()) {
+				return
+			}
+		}
+	}
+}
+
 func truncate(value string, limit int) string {
 	if len(value) <= limit {
 		return value
 	}
 	return value[:limit] + "…"
+}
+
+// ---------------------------------------------------------------- renewing
+
+// renewSkew is how long before a token's expiry the renewal loop moves on it.
+//
+// Three days absorbs a long upstream outage plus a weekend of failed retries,
+// with margin: renewal is a single lightweight POST whose only prerequisite is
+// that the old token still validates, so even a window measured in hours would
+// do — this just keeps the loop out of the panic business entirely.
+const renewSkew = 3 * 24 * time.Hour
+
+// renewDedup is how long a successful renewal holds the loop off an account.
+// The swap is idempotent and the old token survives it, so a redundant pass is
+// merely a wasted request; the dedup window exists to keep a burst of sweeps
+// from stampeding the renewal endpoint, not to guard correctness.
+const renewDedup = 24 * time.Hour
+
+// tokenExpiry decodes the JWT's exp claim without verifying the signature —
+// the upstream validates it, and locally the claim is only read to schedule
+// the renewal. A token without a parsable exp reports zero: the loop then
+// skips the account rather than renewing on a guess. That is the safe side:
+// renewing an unparseable token would be fine (the endpoint would answer or
+// not), but a stampede of pointless renewals every half hour would not.
+func tokenExpiry(token string) time.Time {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 3 {
+		return time.Time{}
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if json.Unmarshal(raw, &claims) != nil || claims.Exp <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(claims.Exp, 0)
+}
+
+// RenewOne renews a single account's token through the official endpoint and
+// persists the result. Exported for the console's per-account button.
+//
+// Failure touches nothing: the old token is still valid after a rejected
+// renewal, and the loop simply tries again later. A success updates the token,
+// stamps the renewal, and records the new expiry for the console.
+func (s *Service) RenewOne(ctx context.Context, id string) (time.Time, error) {
+	account, ok := s.store.AccountByID(id)
+	if !ok {
+		return time.Time{}, errors.New("账号不存在")
+	}
+	if strings.TrimSpace(account.Token) == "" {
+		return time.Time{}, errors.New("账号没有 token")
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, s.settings().SigninTimeout())
+	defer cancel()
+	fresh, err := s.client.RenewToken(callCtx, s.credOf(account))
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	exp := tokenExpiry(fresh)
+	if exp.IsZero() {
+		// The endpoint answered but the payload does not parse as our JWT
+		// shape. Do not store a token we cannot schedule; leave the old one in
+		// force and surface the oddity.
+		return time.Time{}, errors.New("renewal 返回的 token 无法解析 exp，未落库")
+	}
+	s.store.SaveAccountState(id, func(target *store.Account) {
+		target.Token = fresh
+		target.TokenRenewedAt = time.Now()
+		target.TokenRenewExp = exp
+	})
+	return exp, nil
+}
+
+// renewLoop keeps every token ahead of its expiry.
+//
+// Each account's JWT carries an exp (about 30 days out); the official
+// /user/renewal endpoint swaps it for a fresh one, no login flow involved. The
+// loop walks the pool every half hour and renews whatever falls inside the
+// skew window — typically a handful of accounts a day, given the pool's
+// original issue dates cluster within days of each other.
+//
+// There is no lock coordination with the sweep: renewal touches a different
+// endpoint, needs no prepare sequence, and replaces state the sweep does not
+// read. The only shared resource is the risk control, paid for with the same
+// gap spacing.
+func (s *Service) renewLoop(ctx context.Context) {
+	for {
+		if !sleep(ctx, 30*time.Minute) {
+			return
+		}
+		if !s.StartRenewPass() {
+			continue // a manual pass is in flight; it covers the same ground
+		}
+		if !s.renewPass(ctx) {
+			s.EndRenewPass()
+			return
+		}
+		s.EndRenewPass()
+	}
+}
+
+// StartRenewPass claims the renewal slot for a pool-wide pass, reporting false
+// when one is already running — the console's button and the timed loop both
+// come through here, and a double pass would only stampede the endpoint.
+func (s *Service) StartRenewPass() bool {
+	s.renewMu.Lock()
+	defer s.renewMu.Unlock()
+	if s.renewRunning {
+		return false
+	}
+	s.renewRunning = true
+	return true
+}
+
+// EndRenewPass releases the renewal slot.
+func (s *Service) EndRenewPass() {
+	s.renewMu.Lock()
+	defer s.renewMu.Unlock()
+	s.renewRunning = false
+}
+
+// RenewPassDetached runs one pool-wide pass under the claimed slot. It is the
+// console entry's body; the timed loop calls renewPass directly. Reports false
+// only when the context died mid-pass.
+func (s *Service) RenewPassDetached(ctx context.Context) bool {
+	return s.renewPass(ctx)
+}
+
+// Renewing reports whether a pool-wide renewal pass is in flight, for the
+// console's button state.
+func (s *Service) Renewing() bool {
+	s.renewMu.Lock()
+	defer s.renewMu.Unlock()
+	return s.renewRunning
+}
+
+// renewPass walks the pool once, renewing every account inside the window. It
+// reports false only when the context died mid-pass.
+//
+// An account is due when its token's exp falls inside the skew window. The exp
+// is the stored TokenRenewExp when a renewal already landed, otherwise decoded
+// straight from the current token. A successful renewal also stamps
+// TokenRenewedAt, and the dedup window keeps a same-day second pass from
+// re-hitting the endpoint for an account it just served.
+func (s *Service) renewPass(ctx context.Context) bool {
+	now := time.Now()
+	due := 0
+	for _, account := range s.store.ListAccounts() {
+		if ctx.Err() != nil {
+			return false
+		}
+		if account.Region != store.RegionGlobal || strings.TrimSpace(account.Token) == "" {
+			continue
+		}
+		exp := account.TokenRenewExp
+		if exp.IsZero() {
+			exp = tokenExpiry(account.Token)
+		}
+		if exp.IsZero() || now.Add(renewSkew).Before(exp) {
+			// Unparsable token (never schedule on a guess), or expiry safely
+			// beyond the window.
+			continue
+		}
+		if !account.TokenRenewedAt.IsZero() && now.Sub(account.TokenRenewedAt) < renewDedup {
+			continue
+		}
+		due++
+		newExp, err := s.RenewOne(ctx, account.ID)
+		if err != nil {
+			// The old token remains valid — a rejected renewal is a retry,
+			// not a retirement. Say so and move on.
+			log.Printf("token 续期 %s 失败（旧 token 未受影响）：%v", account.Name, err)
+		} else {
+			log.Printf("token 续期 %s：新到期 %s", account.Name, newExp.Local().Format("01-02 15:04"))
+		}
+		if !sleep(ctx, s.settings().SigninGap()) {
+			return false
+		}
+	}
+	if due > 0 {
+		log.Printf("token 续期轮完成：处理 %d 个账号", due)
+	}
+	return true
 }

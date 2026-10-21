@@ -1,15 +1,17 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 
-import { apiRequest, readToken, writeToken } from "@/shared/api/client";
+import { apiRequest, ApiError, readStoredKey, readToken, writeStoredKey, writeToken } from "@/shared/api/client";
 
 export type AdminProfile = { username: string; role: string };
+
+type LoginResult = { token: string; username: string; role: string };
 
 type AuthContextValue = {
   admin: AdminProfile | null;
   ready: boolean;
-  login: (username: string, password: string) => Promise<void>;
+  login: (key: string) => Promise<void>;
   logout: () => Promise<void>;
-  changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
+  changeKey: (currentKey: string, newKey: string) => Promise<void>;
 };
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -20,19 +22,45 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
+    const settle = (profile: AdminProfile | null) => {
+      if (cancelled) return;
+      setAdmin(profile);
+      setReady(true);
+    };
     async function restore(): Promise<void> {
-      if (!readToken()) {
-        setReady(true);
-        return;
+      const storedKey = readStoredKey();
+      if (readToken()) {
+        try {
+          settle(await apiRequest<AdminProfile>("/admin/api/auth/me"));
+          return;
+        } catch {
+          // Session expired (server restart or 12h TTL) — fall through and try
+          // the locally saved credential.
+          writeToken("");
+        }
       }
-      try {
-        const profile = await apiRequest<AdminProfile>("/admin/api/auth/me");
-        if (!cancelled) setAdmin(profile);
-      } catch {
-        writeToken("");
-      } finally {
-        if (!cancelled) setReady(true);
+      if (storedKey) {
+        try {
+          const result = await apiRequest<LoginResult>("/admin/api/auth/login", {
+            method: "POST",
+            body: { key: storedKey },
+            auth: false,
+          });
+          if (!cancelled) {
+            writeToken(result.token);
+            setAdmin({ username: result.username, role: result.role });
+            setReady(true);
+          }
+          return;
+        } catch (error) {
+          // Only a 401 from the login endpoint proves the saved key is stale
+          // (it was changed on the server). Any other failure — server down,
+          // tunnel offline — must keep the credential, or one unreachable
+          // moment would erase the very thing this flow exists to preserve.
+          if (error instanceof ApiError && error.status === 401) writeStoredKey("");
+        }
       }
+      settle(null);
     }
     void restore();
     return () => {
@@ -40,12 +68,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const login = useCallback(async (username: string, password: string) => {
-    const result = await apiRequest<{ token: string; username: string; role: string }>(
-      "/admin/api/auth/login",
-      { method: "POST", body: { username, password }, auth: false },
-    );
+  const login = useCallback(async (key: string) => {
+    const result = await apiRequest<LoginResult>("/admin/api/auth/login", {
+      method: "POST",
+      body: { key },
+      auth: false,
+    });
     writeToken(result.token);
+    writeStoredKey(key);
     setAdmin({ username: result.username, role: result.role });
   }, []);
 
@@ -56,21 +86,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       /* ignore */
     }
     writeToken("");
+    writeStoredKey("");
     setAdmin(null);
   }, []);
 
-  const changePassword = useCallback(async (currentPassword: string, newPassword: string) => {
-    await apiRequest("/admin/api/auth/password", {
+  const changeKey = useCallback(async (currentKey: string, newKey: string) => {
+    await apiRequest("/admin/api/auth/key", {
       method: "POST",
-      body: { currentPassword, newPassword },
+      body: { currentKey, newKey },
     });
-    writeToken("");
-    setAdmin(null);
+    // The server revokes every session on a key change, so log back in with
+    // the new key right away instead of dumping the operator at the login
+    // panel, and refresh the stored credential to match.
+    const result = await apiRequest<LoginResult>("/admin/api/auth/login", {
+      method: "POST",
+      body: { key: newKey },
+      auth: false,
+    });
+    writeToken(result.token);
+    writeStoredKey(newKey);
+    setAdmin({ username: result.username, role: result.role });
   }, []);
 
   const value = useMemo<AuthContextValue>(
-    () => ({ admin, ready, login, logout, changePassword }),
-    [admin, ready, login, logout, changePassword],
+    () => ({ admin, ready, login, logout, changeKey }),
+    [admin, ready, login, logout, changeKey],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

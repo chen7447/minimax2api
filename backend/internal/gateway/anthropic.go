@@ -75,9 +75,32 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A retired model must not fall back to another one: the client pinned the
+	// name, and an answer from a different model is worse than an error.
+	if request.Model != "" {
+		if retired, ok := g.store.ModelByID(request.Model); ok && retired.Unavailable {
+			writeAnthropicError(out, http.StatusBadRequest, "invalid_request_error", unavailableModelMessage+"（"+request.Model+"）")
+			return
+		}
+	}
 	model := g.resolveAnthropicModel(request.Model)
+	if key.Pool == "gongyi" {
+		// Public pool: pin the model regardless of what the client sent.
+		model, _ = g.store.ModelByID("minimax-m3")
+		if model == nil || !model.Enabled || model.Unavailable {
+			writeAnthropicError(out, http.StatusBadRequest, "invalid_request_error", "public pool model minimax-m3 is unavailable")
+			return
+		}
+	}
 	if model == nil {
 		writeAnthropicError(out, http.StatusBadRequest, "invalid_request_error", "no chat model is available in the catalogue")
+		return
+	}
+
+	// The model transport takes the conversation as it stands, so the flattening
+	// below does not apply to it. See direct.go.
+	if g.directMode() {
+		g.anthropicDirect(out, r, key, model, request, body, started)
 		return
 	}
 
@@ -108,29 +131,37 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	splitter := newToolSplitter(toolsEnabled)
 	stream := newAnthropicStream(out, model.ID, estimateTokens(prompt))
 
+	// committed marks answer bytes actually forwarded. message_start does not
+	// count: while only the opener has gone out, a failed attempt can still
+	// fail over to another account without appending a second answer.
+	var committed bool
 	var onDelta, onThinking func(string)
 	if request.Stream {
 		onDelta = func(text string) {
 			if safe := splitter.push(text); safe != "" {
+				committed = true
 				stream.text(safe)
 			}
 		}
 		onThinking = func(text string) {
+			committed = true
 			stream.thinking(text)
 		}
 		stream.start()
 	}
 
 	turn, lastErr := g.runTurn(r.Context(), turnRequest{
-		Prompt:     prompt,
-		Images:     images,
-		Mode:       mode,
-		Model:      model,
-		SessionKey: "",
-		Started:    started,
-		OnDelta:    onDelta,
-		OnThinking: onThinking,
-		Committed:  func() bool { return out.wroteHeader },
+		Prompt:          prompt,
+		Images:          images,
+		Mode:            mode,
+		Model:           model,
+		SessionKey:      "",
+		Group:           key.Pool,
+		DisableThinking: key.Pool == "gongyi",
+		Started:         started,
+		OnDelta:         onDelta,
+		OnThinking:      onThinking,
+		Committed:       func() bool { return committed },
 	})
 
 	promptTokens := estimateTokens(prompt)
@@ -225,12 +256,12 @@ func (g *Gateway) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 // resolveAnthropicModel picks the catalogue entry an Anthropic request maps to.
 func (g *Gateway) resolveAnthropicModel(name string) *store.ModelConfig {
 	if name != "" {
-		if model, ok := g.store.ModelByID(name); ok && model.Enabled && model.Type == store.ModelTypeChat {
+		if model, ok := g.store.ModelByID(name); ok && model.Enabled && !model.Unavailable && model.Type == store.ModelTypeChat {
 			return model
 		}
 	}
 	for _, candidate := range []string{"minimax-agent", "minimax-m3"} {
-		if model, ok := g.store.ModelByID(candidate); ok && model.Enabled && model.Type == store.ModelTypeChat {
+		if model, ok := g.store.ModelByID(candidate); ok && model.Enabled && !model.Unavailable && model.Type == store.ModelTypeChat {
 			return model
 		}
 	}
@@ -344,6 +375,11 @@ func anthropicBlocks(raw json.RawMessage) (string, []string) {
 		Source  struct {
 			Type string `json:"type"`
 			URL  string `json:"url"`
+			// An Anthropic image block is either a url source or a base64 one;
+			// both spellings are in the wild and both have to survive the
+			// translation to an attachment.
+			MediaType string `json:"media_type"`
+			Data      string `json:"data"`
 		} `json:"source"`
 	}
 	if err := json.Unmarshal(raw, &blocks); err != nil {
@@ -362,8 +398,19 @@ func anthropicBlocks(raw json.RawMessage) (string, []string) {
 			// Prior reasoning is context the model produced; replaying it adds
 			// nothing and costs tokens on every turn.
 		case "image":
-			if block.Source.URL != "" {
+			// Both source spellings collapse to the same thing here: a
+			// reference the gateway resolves into an upload. A base64 source
+			// becomes the data URI the OpenAI path already speaks, so the two
+			// front ends share one resolution path.
+			switch {
+			case block.Source.URL != "":
 				images = append(images, block.Source.URL)
+			case block.Source.Data != "":
+				mediaType := strings.TrimSpace(block.Source.MediaType)
+				if mediaType == "" {
+					mediaType = "image/png"
+				}
+				images = append(images, "data:"+mediaType+";base64,"+block.Source.Data)
 			}
 		case "tool_use":
 			parts = append(parts, fmt.Sprintf("[调用了工具 %s，参数 %s]", block.Name, string(block.Input)))

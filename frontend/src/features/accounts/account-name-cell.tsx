@@ -11,6 +11,7 @@ const STATUS_TONE: Record<AccountStatus, string> = {
   cooldown: "bg-amber-500/10 text-amber-700 dark:text-amber-300",
   disabled: "bg-muted text-muted-foreground",
   invalid: "bg-red-500/10 text-red-700 dark:text-red-300",
+  exhausted: "bg-orange-500/10 text-orange-700 dark:text-orange-300",
 };
 
 export function AccountNameCell({ account }: { account: AccountDTO }) {
@@ -70,14 +71,18 @@ export function AccountStatusCell({ account }: { account: AccountDTO }) {
         ? t("accounts.statusCooldown")
         : effective === "disabled"
           ? t("accounts.statusDisabled")
-          : t("accounts.statusInvalid");
+          : effective === "exhausted"
+            ? t("accounts.statusExhausted")
+            : t("accounts.statusInvalid");
 
   const detail =
-    account.status !== "cooldown"
-      ? account.lastError || ""
-      : cooling
-        ? t("accounts.quotaResetAt", { time: formatRelative(account.cooldownUntil, i18n.language) })
-        : t("accounts.cooldownElapsed");
+    account.status === "exhausted"
+      ? t("accounts.exhaustedSince", { time: formatRelative(account.exhaustedAt, i18n.language) })
+      : account.status !== "cooldown"
+        ? account.lastError || ""
+        : cooling
+          ? t("accounts.quotaResetAt", { time: formatRelative(account.cooldownUntil, i18n.language) })
+          : t("accounts.cooldownElapsed");
 
   return (
     <div className="flex flex-col items-center gap-1">

@@ -19,19 +19,23 @@ type Draft = {
   addr: string;
   maxConcurrentRequests: number;
   adminUsername: string;
-  adminPassword: string;
+  adminKey: string;
   baseURL: string;
   baseURLCN: string;
   streamBaseURL: string;
   agentID: string;
   sessionPath: string;
   messagePath: string;
+  mode: SettingsDTO["upstream"]["mode"];
+  modelPath: string;
+  modelsPath: string;
   userInfoPath: string;
   agentListPath: string;
   configPath: string;
   connectionsPath: string;
   summariesPath: string;
   driveFilePath: string;
+  uploadsPath: string;
   modelPayload: string;
   language: string;
   screenWidth: number;
@@ -47,6 +51,8 @@ type Draft = {
   capacityWaitSec: number;
   stickyTTLSec: number;
   preferIdle: boolean;
+  activePoolSize: number;
+  exhaustedRetryHours: number;
   retentionDays: number;
   maxRecords: number;
   recordBody: boolean;
@@ -60,8 +66,6 @@ type Draft = {
   // the upstream block: `lang` sits beside `language`, and `enabled` reads as
   // the whole gateway's switch rather than one section's.
   signinEnabled: boolean;
-  signinHour: number;
-  signinMinute: number;
   signinGapSeconds: number;
   signinTimeoutSec: number;
   signinSkipZeroCredit: boolean;
@@ -92,14 +96,12 @@ function toDraft(settings: SettingsDTO): Draft {
   const video = settings.video;
   return {
     ...settings.server,
-    adminPassword: "",
+    adminKey: "",
     ...settings.upstream,
     ...settings.routing,
     ...settings.audit,
     ...settings.media,
     signinEnabled: signin.enabled,
-    signinHour: signin.hour,
-    signinMinute: signin.minute,
     signinGapSeconds: signin.gapSeconds,
     signinTimeoutSec: signin.timeoutSec,
     signinSkipZeroCredit: signin.skipZeroCredit,
@@ -151,12 +153,16 @@ export function SettingsPage() {
           agentID: value.agentID,
           sessionPath: value.sessionPath,
           messagePath: value.messagePath,
+          mode: value.mode,
+          modelPath: value.modelPath,
+          modelsPath: value.modelsPath,
           userInfoPath: value.userInfoPath,
           agentListPath: value.agentListPath,
           configPath: value.configPath,
           connectionsPath: value.connectionsPath,
           summariesPath: value.summariesPath,
           driveFilePath: value.driveFilePath,
+          uploadsPath: value.uploadsPath,
           modelPayload: value.modelPayload,
           language: value.language,
           screenWidth: value.screenWidth,
@@ -174,6 +180,8 @@ export function SettingsPage() {
           capacityWaitSec: value.capacityWaitSec,
           stickyTTLSec: value.stickyTTLSec,
           preferIdle: value.preferIdle,
+          activePoolSize: value.activePoolSize,
+          exhaustedRetryHours: value.exhaustedRetryHours,
         },
         audit: {
           retentionDays: value.retentionDays,
@@ -189,8 +197,11 @@ export function SettingsPage() {
         },
         signin: {
           enabled: value.signinEnabled,
-          hour: value.signinHour,
-          minute: value.signinMinute,
+          // The server preserves these three across a save; they are round-
+          // tripped from the last GET so the payload type stays complete.
+          hour: settingsQuery.data?.signin.hour ?? 0,
+          minute: settingsQuery.data?.signin.minute ?? 0,
+          slotSeed: settingsQuery.data?.signin.slotSeed ?? "",
           gapSeconds: value.signinGapSeconds,
           timeoutSec: value.signinTimeoutSec,
           skipZeroCredit: value.signinSkipZeroCredit,
@@ -217,7 +228,7 @@ export function SettingsPage() {
           defaultDuration: value.videoDefaultDuration,
           timeoutSec: value.videoTimeoutSec,
         },
-        ...(value.adminPassword ? { adminPassword: value.adminPassword } : {}),
+        ...(value.adminKey ? { adminKey: value.adminKey } : {}),
       }),
     onSuccess: () => {
       toast.success(t("settings.saved"));
@@ -276,13 +287,13 @@ export function SettingsPage() {
           <Field label={t("settings.server.adminUsername")}>
             <Input value={draft.adminUsername} onChange={(event) => set("adminUsername", event.target.value)} />
           </Field>
-          <Field label={t("settings.server.adminPassword")} help={t("settings.server.adminPasswordHelp")}>
+          <Field label={t("settings.server.adminKey")} help={t("settings.server.adminKeyHelp")}>
             <Input
               type="password"
               autoComplete="new-password"
-              value={draft.adminPassword}
+              value={draft.adminKey}
               placeholder="••••••••"
-              onChange={(event) => set("adminPassword", event.target.value)}
+              onChange={(event) => set("adminKey", event.target.value)}
             />
           </Field>
         </SettingsGroup>
@@ -316,6 +327,30 @@ export function SettingsPage() {
               className="font-mono text-[11px]"
               value={draft.messagePath}
               onChange={(event) => set("messagePath", event.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.upstream.mode")} help={t("settings.upstream.modeHelp")}>
+            <Select
+              value={draft.mode}
+              onChange={(value) => set("mode", value as Draft["mode"])}
+              options={[
+                { value: "agent", label: t("settings.upstream.modeAgent") },
+                { value: "direct", label: t("settings.upstream.modeDirect") },
+              ]}
+            />
+          </Field>
+          <Field label={t("settings.upstream.modelPath")} help={t("settings.upstream.modelPathHelp")}>
+            <Input
+              className="font-mono text-[11px]"
+              value={draft.modelPath}
+              onChange={(event) => set("modelPath", event.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.upstream.modelsPath")} help={t("settings.upstream.modelsPathHelp")}>
+            <Input
+              className="font-mono text-[11px]"
+              value={draft.modelsPath}
+              onChange={(event) => set("modelsPath", event.target.value)}
             />
           </Field>
           <Field label={t("settings.upstream.userInfoPath")} help={t("settings.upstream.userInfoPathHelp")}>
@@ -358,6 +393,13 @@ export function SettingsPage() {
               className="font-mono text-[11px]"
               value={draft.driveFilePath}
               onChange={(event) => set("driveFilePath", event.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.upstream.uploadsPath")} help={t("settings.upstream.uploadsPathHelp")}>
+            <Input
+              className="font-mono text-[11px]"
+              value={draft.uploadsPath}
+              onChange={(event) => set("uploadsPath", event.target.value)}
             />
           </Field>
           <Field label={t("settings.upstream.modelPayload")} help={t("settings.upstream.modelPayloadHelp")}>
@@ -476,6 +518,24 @@ export function SettingsPage() {
           <Field label={t("settings.routing.preferFast")} help={t("settings.routing.preferFastHelp")}>
             <Switch checked={draft.preferIdle} onCheckedChange={(value) => set("preferIdle", value)} />
           </Field>
+          <Field label={t("settings.routing.activePoolSize")} help={t("settings.routing.activePoolSizeHelp")}>
+            <Input
+              type="number"
+              min={0}
+              max={64}
+              value={draft.activePoolSize}
+              onChange={(event) => set("activePoolSize", Number(event.target.value))}
+            />
+          </Field>
+          <Field label={t("settings.routing.exhaustedRetryHours")} unit={t("settings.units.hours")} help={t("settings.routing.exhaustedRetryHelp")}>
+            <Input
+              type="number"
+              min={0}
+              max={720}
+              value={draft.exhaustedRetryHours}
+              onChange={(event) => set("exhaustedRetryHours", Number(event.target.value))}
+            />
+          </Field>
         </SettingsGroup>
 
         <SettingsGroup icon={<ScrollText />} title={t("settings.groups.audit")}>
@@ -540,27 +600,9 @@ export function SettingsPage() {
           <Field label={t("settings.signin.enabled")} help={t("settings.signin.enabledHelp")}>
             <Switch checked={draft.signinEnabled} onCheckedChange={(value) => set("signinEnabled", value)} />
           </Field>
-          <Field label={t("settings.signin.time")} help={t("settings.signin.timeHelp")}>
-            <div className="flex items-center gap-2">
-              <Input
-                type="number"
-                min={0}
-                max={23}
-                aria-label={t("settings.signin.time")}
-                className="w-20"
-                value={draft.signinHour}
-                onChange={(event) => set("signinHour", Number(event.target.value))}
-              />
-              <span className="text-xs text-muted-foreground">:</span>
-              <Input
-                type="number"
-                min={0}
-                max={59}
-                aria-label={t("settings.signin.time")}
-                className="w-20"
-                value={draft.signinMinute}
-                onChange={(event) => set("signinMinute", Number(event.target.value))}
-              />
+          <Field label={t("settings.signin.slot")} help={t("settings.signin.slotHelp")}>
+            <div className="text-sm text-muted-foreground">
+              {t("settings.signin.slotValue")}
             </div>
           </Field>
           <Field label={t("settings.signin.gap")} unit={t("settings.units.seconds")} help={t("settings.signin.gapHelp")}>

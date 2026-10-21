@@ -41,6 +41,9 @@ func newFixture(t *testing.T) *fixture {
 	settings.Routing.StickyTTLSec = 300
 	settings.Routing.CooldownBaseSec = 2
 	settings.Routing.CooldownMaxSec = 8
+	// Legacy whole-pool scheduling. The working set ("使用池") has its own
+	// tests below that opt in with an explicit size.
+	settings.Routing.ActivePoolSize = 0
 
 	f := &fixture{store: st, settings: &settings}
 	f.pool = New(st, func() config.Settings { return *f.settings })
@@ -85,7 +88,7 @@ func (f *fixture) addAccountWith(t *testing.T, id string, priority int, token st
 // acquire is the happy-path helper: borrow, assert success, hand back the lease.
 func (f *fixture) acquire(t *testing.T, sessionKey string) *Lease {
 	t.Helper()
-	lease, err := f.pool.Acquire(context.Background(), sessionKey)
+	lease, err := f.pool.Acquire(context.Background(), sessionKey, "")
 	if err != nil {
 		t.Fatalf("acquire(%q): %v", sessionKey, err)
 	}
@@ -214,7 +217,7 @@ func TestAcquireRespectsMaxConcurrent(t *testing.T) {
 
 	// The only account is saturated, so a second attempt must report no capacity
 	// rather than oversubscribing it.
-	_, err := f.pool.Acquire(context.Background(), "")
+	_, err := f.pool.Acquire(context.Background(), "", "")
 	if !errors.Is(err, ErrNoCapacity) {
 		t.Fatalf("err = %v, want ErrNoCapacity", err)
 	}
@@ -292,7 +295,7 @@ func TestRoutableSkipsSpentAccounts(t *testing.T) {
 func TestAcquireReportsEmptyPool(t *testing.T) {
 	f := newFixture(t)
 
-	if _, err := f.pool.Acquire(context.Background(), ""); !errors.Is(err, ErrNoAccount) {
+	if _, err := f.pool.Acquire(context.Background(), "", ""); !errors.Is(err, ErrNoAccount) {
 		t.Fatalf("err = %v, want ErrNoAccount", err)
 	}
 }
@@ -312,7 +315,7 @@ func TestAcquireHonoursContextCancellation(t *testing.T) {
 	}()
 
 	start := time.Now()
-	_, err := f.pool.Acquire(ctx, "")
+	_, err := f.pool.Acquire(ctx, "", "")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
@@ -332,7 +335,7 @@ func TestAcquireWaitsForCapacityThenSucceeds(t *testing.T) {
 		held.Release(nil)
 	}()
 
-	lease, err := f.pool.Acquire(context.Background(), "")
+	lease, err := f.pool.Acquire(context.Background(), "", "")
 	if err != nil {
 		t.Fatalf("acquire after release: %v", err)
 	}
@@ -471,9 +474,9 @@ func TestStickySessionExpires(t *testing.T) {
 	// Let the binding lapse, then confirm the session is free to be rescheduled
 	// rather than pinned forever.
 	f.pool.mu.Lock()
-	entry := f.pool.sticky["session-1"]
+	entry := f.pool.sticky["|session-1"]
 	entry.expires = time.Now().Add(-time.Second)
-	f.pool.sticky["session-1"] = entry
+	f.pool.sticky["|session-1"] = entry
 	f.pool.mu.Unlock()
 
 	second := f.acquire(t, "session-1")
@@ -518,6 +521,108 @@ func TestStickyDisabledWhenTTLZero(t *testing.T) {
 
 	if first.Account.ID == second.Account.ID {
 		t.Fatal("sticky TTL 0 still pinned the session")
+	}
+}
+
+// --- working set ("使用池") -------------------------------------------------
+
+// The working set backfills from the reserve by highest known credit, so an
+// incoming giant request lands on the account best able to pay for it rather
+// than on whichever account happens to be oldest.
+func TestWorkingSetBackfillsHighestCredit(t *testing.T) {
+	f := newFixture(t)
+	f.settings.Routing.ActivePoolSize = 1
+	f.addAccount(t, "low", 50)
+	f.addAccount(t, "high", 50)
+	f.addAccount(t, "mid", 50)
+	f.store.SaveAccountState("low", func(a *store.Account) {
+		a.Credit = &store.Credit{Total: 10, SyncedAt: time.Now()}
+	})
+	f.store.SaveAccountState("high", func(a *store.Account) {
+		a.Credit = &store.Credit{Total: 500, SyncedAt: time.Now()}
+	})
+	f.store.SaveAccountState("mid", func(a *store.Account) {
+		a.Credit = &store.Credit{Total: 100, SyncedAt: time.Now()}
+	})
+
+	lease := f.acquire(t, "session-1")
+	defer lease.Release(nil)
+	if lease.Account.ID != "high" {
+		t.Fatalf("backfill selected %q, want high (most credit)", lease.Account.ID)
+	}
+	if len(f.pool.activePool) != 1 {
+		t.Fatalf("working set holds %d accounts, want 1", len(f.pool.activePool))
+	}
+}
+
+// A drained balance takes the account out of the working set outright and the
+// very next pick backfills from the reserve — the failure mode this replaces
+// (a 15-minute cooldown during which the drained account kept being picked
+// first and eating every retry) is what burned the pool on 2026-10-07.
+func TestWorkingSetEvictsExhaustedAndBackfills(t *testing.T) {
+	f := newFixture(t)
+	f.settings.Routing.ActivePoolSize = 1
+	f.addAccountWith(t, "a", 50, "oauth_token=a", 5)
+	f.addAccountWith(t, "b", 50, "oauth_token=b", 5)
+	f.store.SaveAccountState("a", func(a *store.Account) {
+		a.Credit = &store.Credit{Total: 10, SyncedAt: time.Now()}
+	})
+	f.store.SaveAccountState("b", func(a *store.Account) {
+		a.Credit = &store.Credit{Total: 5, SyncedAt: time.Now()}
+	})
+
+	first := f.acquire(t, "session-1")
+	if first.Account.ID != "a" {
+		t.Fatalf("first selection = %q, want a (most credit)", first.Account.ID)
+	}
+	first.Release(ErrQuotaDrained)
+
+	drained := f.reload(t, "a")
+	if drained.Status != store.StatusExhausted || drained.ExhaustedAt.IsZero() {
+		t.Fatalf("drained account status = %q exhaustedAt zero=%v, want exhausted+stamped",
+			drained.Status, drained.ExhaustedAt.IsZero())
+	}
+
+	second := f.acquire(t, "session-1")
+	defer second.Release(nil)
+	if second.Account.ID != "b" {
+		t.Fatalf("after eviction selected %q, want b (backfill from reserve)", second.Account.ID)
+	}
+}
+
+// Exhausted is not a cooldown: no window elapses that makes the account
+// schedulable again. Only a credit reading (or a manual revive) does.
+func TestExhaustedAccountNotRoutable(t *testing.T) {
+	f := newFixture(t)
+	f.addAccount(t, "a", 50)
+	f.store.SaveAccountState("a", func(a *store.Account) {
+		a.Status = store.StatusExhausted
+		a.ExhaustedAt = time.Now()
+	})
+
+	if _, err := f.pool.Acquire(context.Background(), "session-1", ""); err != ErrNoCapacity {
+		t.Fatalf("acquire on exhausted pool = %v, want ErrNoCapacity", err)
+	}
+}
+
+// The operator's priority breaks credit ties in the backfill: randomness only
+// applies to accounts equal on both.
+func TestWorkingSetPriorityBreaksCreditTie(t *testing.T) {
+	f := newFixture(t)
+	f.settings.Routing.ActivePoolSize = 1
+	f.addAccount(t, "lowPrio", 99)
+	f.addAccount(t, "highPrio", 1)
+	f.store.SaveAccountState("lowPrio", func(a *store.Account) {
+		a.Credit = &store.Credit{Total: 100, SyncedAt: time.Now()}
+	})
+	f.store.SaveAccountState("highPrio", func(a *store.Account) {
+		a.Credit = &store.Credit{Total: 100, SyncedAt: time.Now()}
+	})
+
+	lease := f.acquire(t, "session-1")
+	defer lease.Release(nil)
+	if lease.Account.ID != "highPrio" {
+		t.Fatalf("backfill selected %q, want highPrio (priority breaks the tie)", lease.Account.ID)
 	}
 }
 
@@ -689,7 +794,7 @@ func TestClearCooldownRestoresRoutability(t *testing.T) {
 		acc.LastError = "nope"
 	})
 
-	if _, err := f.pool.Acquire(context.Background(), ""); !errors.Is(err, ErrNoCapacity) {
+	if _, err := f.pool.Acquire(context.Background(), "", ""); !errors.Is(err, ErrNoCapacity) {
 		t.Fatalf("err = %v, want ErrNoCapacity while cooling", err)
 	}
 
@@ -722,7 +827,7 @@ func TestSummaryCountsEveryStatus(t *testing.T) {
 	}
 	f.store.SaveAccountState("dead", func(a *store.Account) { a.Status = store.StatusInvalid })
 
-	total, active, cooldown, disabled, invalid, routableCount := f.pool.Summary()
+	total, active, cooldown, disabled, invalid, _, routableCount := f.pool.Summary()
 	if total != 4 || active != 1 || cooldown != 1 || disabled != 1 || invalid != 1 {
 		t.Fatalf("summary = total %d active %d cooldown %d disabled %d invalid %d",
 			total, active, cooldown, disabled, invalid)
@@ -740,7 +845,7 @@ func TestSummaryCountsAccountDisabledViaSaveState(t *testing.T) {
 	f.addAccount(t, "a", 0)
 	f.store.SaveAccountState("a", func(acc *store.Account) { acc.Enabled = false })
 
-	total, active, _, disabled, _, routableCount := f.pool.Summary()
+	total, active, _, disabled, _, _, routableCount := f.pool.Summary()
 	if total != 1 || disabled != 1 || active != 0 {
 		t.Fatalf("summary = total %d active %d disabled %d, want 1/0/1", total, active, disabled)
 	}
@@ -761,7 +866,7 @@ func TestSummaryTreatsElapsedCooldownAsActive(t *testing.T) {
 		a.CooldownUntil = time.Now().Add(-time.Minute)
 	})
 
-	total, active, cooldown, _, _, routableCount := f.pool.Summary()
+	total, active, cooldown, _, _, _, routableCount := f.pool.Summary()
 	if total != 1 || active != 1 || cooldown != 0 {
 		t.Fatalf("summary = total %d active %d cooldown %d, want 1/1/0", total, active, cooldown)
 	}
@@ -810,7 +915,7 @@ func TestConcurrentSchedulingAndStateWrites(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			for i := 0; i < 40; i++ {
-				lease, err := f.pool.Acquire(ctx, fmt.Sprintf("session-%d", worker))
+				lease, err := f.pool.Acquire(ctx, fmt.Sprintf("session-%d", worker), "")
 				if err != nil {
 					return
 				}

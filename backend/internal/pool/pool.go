@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -20,6 +21,13 @@ var (
 	ErrNoAccount = errors.New("no account available")
 	// ErrNoCapacity means every account is saturated or cooling down.
 	ErrNoCapacity = errors.New("all accounts are busy")
+	// ErrQuotaDrained marks an upstream refusal for lack of balance. It arrives
+	// either as a real HTTP 402 from the model endpoints or as HTTP 200 with
+	// the failure embedded in the assistant content
+	// ("50110:insufficient balance (1008)"); the transports fold both into this
+	// verdict. Only release() can act on it: the account is marked exhausted
+	// and leaves the working set until credits land again.
+	ErrQuotaDrained = errors.New("upstream quota drained (HTTP 402 / 50110 in content)")
 )
 
 type stickyEntry struct {
@@ -34,15 +42,22 @@ type Pool struct {
 	settings func() config.Settings
 	inflight map[string]int
 	sticky   map[string]stickyEntry
-	cursor   int
+	// activePool is the working set the scheduler draws from ("使用池"). It is
+	// advisory state, rebuilt lazily after a restart: pick() tops it up from
+	// the reserve by highest known credit whenever it runs short. Members are
+	// evicted when they turn exhausted, disabled or invalid; a member in a
+	// transient cooldown stays a member and merely waits it out.
+	activePool map[string]time.Time
+	cursor     int
 }
 
 func New(st *store.Store, settings func() config.Settings) *Pool {
 	return &Pool{
-		store:    st,
-		settings: settings,
-		inflight: make(map[string]int),
-		sticky:   make(map[string]stickyEntry),
+		store:      st,
+		settings:   settings,
+		inflight:   make(map[string]int),
+		sticky:     make(map[string]stickyEntry),
+		activePool: make(map[string]time.Time),
 	}
 }
 
@@ -78,13 +93,14 @@ func (p *Pool) Snapshot() map[string]int {
 	return out
 }
 
-// Acquire borrows an account, waiting up to the configured capacity timeout.
-func (p *Pool) Acquire(ctx context.Context, sessionKey string) (*Lease, error) {
+// Acquire borrows an account from the requested pool ("" = personal,
+// "gongyi" = public welfare), waiting up to the configured capacity timeout.
+func (p *Pool) Acquire(ctx context.Context, sessionKey, group string) (*Lease, error) {
 	settings := p.settings()
 	deadline := time.Now().Add(settings.CapacityWait())
 
 	for {
-		account, wait := p.pick(sessionKey)
+		account, wait := p.pick(sessionKey, group)
 		if account != nil {
 			return &Lease{Account: account, pool: p}, nil
 		}
@@ -99,8 +115,17 @@ func (p *Pool) Acquire(ctx context.Context, sessionKey string) (*Lease, error) {
 	}
 }
 
+// matchPool enforces the hard boundary: public keys only see gongyi accounts,
+// personal keys never see them. No cross-pool fallback.
+func matchPool(account *store.Account, group string) bool {
+	if group == "gongyi" {
+		return account.Gongyi
+	}
+	return !account.Gongyi
+}
+
 // pick selects a routable account and reserves an in-flight slot.
-func (p *Pool) pick(sessionKey string) (*store.Account, error) {
+func (p *Pool) pick(sessionKey, group string) (*store.Account, error) {
 	// Read the store and settings before taking p.mu. Keeping every cross
 	// component call outside the critical section means p.mu can never take
 	// part in a lock-order cycle with store.mu.
@@ -114,18 +139,20 @@ func (p *Pool) pick(sessionKey string) (*store.Account, error) {
 	defer p.mu.Unlock()
 
 	now := time.Now()
+	stickyKey := group + "|" + sessionKey
 
 	// Sticky sessions reuse their previous account while it stays routable.
 	if sessionKey != "" && settings.StickyTTL() > 0 {
-		if entry, ok := p.sticky[sessionKey]; ok {
+		if entry, ok := p.sticky[stickyKey]; ok {
 			if now.After(entry.expires) {
-				delete(p.sticky, sessionKey)
+				delete(p.sticky, stickyKey)
 			} else {
 				for _, account := range accounts {
-					if account.ID == entry.accountID && routable(account, p.inflight[account.ID], now, settings) {
+					if account.ID == entry.accountID && matchPool(account, group) &&
+						routable(account, p.inflight[account.ID], now, settings) {
 						p.inflight[account.ID]++
 						entry.expires = now.Add(settings.StickyTTL())
-						p.sticky[sessionKey] = entry
+						p.sticky[stickyKey] = entry
 						return account, nil
 					}
 				}
@@ -135,6 +162,9 @@ func (p *Pool) pick(sessionKey string) (*store.Account, error) {
 
 	candidates := make([]*store.Account, 0, len(accounts))
 	for _, account := range accounts {
+		if !matchPool(account, group) {
+			continue
+		}
 		if routable(account, p.inflight[account.ID], now, settings) {
 			candidates = append(candidates, account)
 		}
@@ -143,6 +173,60 @@ func (p *Pool) pick(sessionKey string) (*store.Account, error) {
 		return nil, ErrNoCapacity
 	}
 
+	// The public pool is small and dedicated; bypass the shared working set so
+	// a public key can never consume a personal account and vice versa.
+	if group != "" {
+		chosen := p.selectLocked(candidates, settings)
+		p.inflight[chosen.ID]++
+		if sessionKey != "" && settings.StickyTTL() > 0 {
+			p.sticky[stickyKey] = stickyEntry{accountID: chosen.ID, expires: now.Add(settings.StickyTTL())}
+		}
+		return chosen, nil
+	}
+
+	poolSize := settings.ActivePoolSize()
+	if poolSize > 0 {
+		p.pruneWorkingSetLocked(accounts)
+	}
+
+	var chosen *store.Account
+	switch {
+	case poolSize <= 0:
+		// Legacy mode: schedule across the whole pool.
+		chosen = p.selectLocked(candidates, settings)
+	default:
+		working := make([]*store.Account, 0, len(candidates))
+		for _, account := range candidates {
+			if _, ok := p.activePool[account.ID]; ok {
+				working = append(working, account)
+			}
+		}
+		if len(working) > 0 {
+			chosen = p.selectLocked(working, settings)
+		} else {
+			// The working set has nothing usable: backfill with the reserve
+			// account of highest credit and use it for this request.
+			chosen = p.admitBestLocked(candidates, now)
+			if chosen == nil {
+				chosen = p.selectLocked(candidates, settings)
+			}
+		}
+		// Keep the working set at its configured size; after a restart this is
+		// what rebuilds it.
+		p.topUpWorkingSetLocked(candidates, now, poolSize)
+	}
+
+	p.inflight[chosen.ID]++
+	if sessionKey != "" && settings.StickyTTL() > 0 {
+		p.sticky[stickyKey] = stickyEntry{accountID: chosen.ID, expires: now.Add(settings.StickyTTL())}
+	}
+	return chosen, nil
+}
+
+// selectLocked applies the configured strategy within the given candidate
+// list. The list is expected to be small (a working set) or already ordered;
+// the stable sort keeps legacy whole-pool behaviour intact.
+func (p *Pool) selectLocked(candidates []*store.Account, settings config.Settings) *store.Account {
 	sort.SliceStable(candidates, func(i, j int) bool {
 		left, right := candidates[i], candidates[j]
 		if settings.Routing.PreferIdle && p.inflight[left.ID] != p.inflight[right.ID] {
@@ -154,29 +238,99 @@ func (p *Pool) pick(sessionKey string) (*store.Account, error) {
 		return left.CreatedAt.Before(right.CreatedAt)
 	})
 
-	var chosen *store.Account
 	switch settings.Routing.Strategy {
 	case "round_robin":
 		p.cursor = (p.cursor + 1) % len(candidates)
-		chosen = candidates[p.cursor]
+		return candidates[p.cursor]
 	case "random":
-		chosen = candidates[rand.Intn(len(candidates))]
+		return candidates[rand.Intn(len(candidates))]
 	case "priority":
-		chosen = candidates[0]
+		return candidates[0]
 	default: // least_inflight
-		chosen = candidates[0]
+		chosen := candidates[0]
 		for _, candidate := range candidates[1:] {
 			if p.inflight[candidate.ID] < p.inflight[chosen.ID] {
 				chosen = candidate
 			}
 		}
+		return chosen
 	}
+}
 
-	p.inflight[chosen.ID]++
-	if sessionKey != "" && settings.StickyTTL() > 0 {
-		p.sticky[sessionKey] = stickyEntry{accountID: chosen.ID, expires: now.Add(settings.StickyTTL())}
+// pruneWorkingSetLocked drops working-set members that can no longer serve at
+// all — exhausted, disabled, invalid or removed. A member in a transient
+// cooldown stays a member: it comes back on its own when the window elapses.
+func (p *Pool) pruneWorkingSetLocked(accounts []*store.Account) {
+	byID := make(map[string]*store.Account, len(accounts))
+	for _, account := range accounts {
+		byID[account.ID] = account
 	}
-	return chosen, nil
+	for id := range p.activePool {
+		account, ok := byID[id]
+		if !ok || !account.Enabled || account.Gongyi ||
+			account.Status == store.StatusExhausted ||
+			account.Status == store.StatusDisabled ||
+			account.Status == store.StatusInvalid {
+			delete(p.activePool, id)
+		}
+	}
+}
+
+// admitBestLocked admits the reserve candidate with the highest known credit
+// into the working set and returns it. The operator's priority breaks credit
+// ties — it is the explicit lever for exactly this choice; accounts equal on
+// both resolve randomly, so a cohort of fresh equal-credit accounts wears
+// evenly instead of always leaning on one. Returns nil when the reserve is
+// empty.
+func (p *Pool) admitBestLocked(candidates []*store.Account, now time.Time) *store.Account {
+	var ties []*store.Account
+	bestCredit, bestPriority := 0, 0
+	seen := false
+	for _, account := range candidates {
+		if _, ok := p.activePool[account.ID]; ok {
+			continue
+		}
+		credit := creditOf(account)
+		better := !seen || credit > bestCredit ||
+			(credit == bestCredit && account.Priority < bestPriority)
+		equal := seen && credit == bestCredit && account.Priority == bestPriority
+		switch {
+		case better:
+			seen = true
+			bestCredit, bestPriority = credit, account.Priority
+			ties = ties[:0]
+			ties = append(ties, account)
+		case equal:
+			ties = append(ties, account)
+		}
+	}
+	if len(ties) == 0 {
+		return nil
+	}
+	chosen := ties[rand.Intn(len(ties))]
+	p.activePool[chosen.ID] = now
+	return chosen
+}
+
+// topUpWorkingSetLocked grows the working set to its configured size with the
+// highest-credit reserve candidates.
+func (p *Pool) topUpWorkingSetLocked(candidates []*store.Account, now time.Time, poolSize int) {
+	for len(p.activePool) < poolSize {
+		if p.admitBestLocked(candidates, now) == nil {
+			return
+		}
+	}
+}
+
+// creditOf ranks an account by its last known balance; an account that has
+// never been probed ranks below any probed one. The reading is advisory — the
+// upstream stays the final authority, and a wrong guess self-corrects on the
+// next 402.
+func creditOf(account *store.Account) int {
+	if account.Credit == nil {
+		return -1
+	}
+	return account.Credit.Total
 }
 
 func routable(account *store.Account, inflight int, now time.Time, settings config.Settings) bool {
@@ -184,7 +338,7 @@ func routable(account *store.Account, inflight int, now time.Time, settings conf
 		return false
 	}
 	switch account.Status {
-	case store.StatusDisabled, store.StatusInvalid:
+	case store.StatusDisabled, store.StatusInvalid, store.StatusExhausted:
 		return false
 	}
 	if account.Status == store.StatusCooldown && now.Before(account.CooldownUntil) {
@@ -254,6 +408,21 @@ func (p *Pool) release(id string, err error) {
 		account.FailCount++
 		account.LastError = truncate(err.Error(), 240)
 
+		if errors.Is(err, ErrQuotaDrained) {
+			// The account is not transiently broken, its balance is spent. It
+			// leaves the working set and the rotation outright — there is no
+			// timed recovery to wait out. It comes back when a credit reading
+			// above zero lands (check-in payout, top-up, manual refresh), or
+			// when the exhausted sweep re-runs its check-in after the
+			// configured interval. A later probe or credit refresh rewrites
+			// Credit either way.
+			account.Status = store.StatusExhausted
+			account.ExhaustedAt = time.Now()
+			account.CooldownUntil = time.Time{}
+			delete(p.activePool, id)
+			return
+		}
+
 		if errors.Is(err, minimax.ErrInvalidCredential) {
 			account.Status = store.StatusInvalid
 			account.CooldownUntil = time.Time{}
@@ -271,28 +440,40 @@ func (p *Pool) release(id string, err error) {
 	})
 }
 
-// ClearCooldown resets a cooling account so it can be scheduled again.
+// ClearCooldown resets a cooling account so it can be scheduled again. It
+// doubles as the manual revive for an exhausted account: the operator (or the
+// console button) is asserting the balance question is settled.
 func (p *Pool) ClearCooldown(id string) {
+	p.mu.Lock()
+	delete(p.activePool, id)
+	p.mu.Unlock()
 	p.store.SaveAccountState(id, func(account *store.Account) {
 		account.Status = store.StatusActive
 		account.CooldownUntil = time.Time{}
+		account.ExhaustedAt = time.Time{}
 		account.FailCount = 0
 		account.LastError = ""
 	})
 }
 
-// DropSticky forgets the sticky binding for a session.
+// DropSticky forgets the sticky binding for a session (both pools).
 func (p *Pool) DropSticky(sessionKey string) {
 	if sessionKey == "" {
 		return
 	}
 	p.mu.Lock()
-	delete(p.sticky, sessionKey)
+	delete(p.sticky, "|"+sessionKey)
+	delete(p.sticky, "gongyi|"+sessionKey)
+	for key := range p.sticky {
+		if strings.HasSuffix(key, "|"+sessionKey) {
+			delete(p.sticky, key)
+		}
+	}
 	p.mu.Unlock()
 }
 
 // Summary reports pool health for dashboards and /health.
-func (p *Pool) Summary() (total, active, cooldown, disabled, invalid, routableCount int) {
+func (p *Pool) Summary() (total, active, cooldown, disabled, invalid, exhausted, routableCount int) {
 	accounts := p.store.ListAccounts()
 	settings := p.settings()
 	now := time.Now()
@@ -309,6 +490,8 @@ func (p *Pool) Summary() (total, active, cooldown, disabled, invalid, routableCo
 			disabled++
 		case account.Status == store.StatusInvalid:
 			invalid++
+		case account.Status == store.StatusExhausted:
+			exhausted++
 		case account.Status == store.StatusCooldown && now.Before(account.CooldownUntil):
 			// Only a cooldown that is still running counts as cooling. Status is
 			// a snapshot written when the failure happened, so it keeps saying

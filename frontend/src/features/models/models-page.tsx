@@ -1,12 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { RefreshCw } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { listModels, updateModel } from "@/features/models/models-api";
+import { listModels, refreshModels, updateModel } from "@/features/models/models-api";
 import { errorMessage } from "@/shared/api/client";
 import { DataTableShell } from "@/shared/components/data-table-shell";
 import { EmptyState } from "@/shared/components/data-state";
@@ -34,13 +36,55 @@ export function ModelsPage() {
     onError: (error) => toast.error(errorMessage(error)),
   });
 
+  const refreshMutation = useMutation({
+    mutationFn: refreshModels,
+    onSuccess: (result) => {
+      void queryClient.invalidateQueries({ queryKey: ["models"] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      if (result.added.length > 0) {
+        toast.success(t("models.refreshAdded", { count: result.added.length }));
+      }
+      if (result.marked.length > 0) {
+        toast.warning(t("models.refreshMarked", { count: result.marked.length }));
+      }
+      if (result.removed.length > 0) {
+        toast.info(t("models.refreshRemoved", { count: result.removed.length }));
+      }
+      if (result.recovered.length > 0) {
+        toast.success(t("models.refreshRecovered", { count: result.recovered.length }));
+      }
+      if (
+        result.added.length === 0 &&
+        result.marked.length === 0 &&
+        result.removed.length === 0 &&
+        result.recovered.length === 0
+      ) {
+        toast.info(t("models.refreshUnchanged"));
+      }
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
   const items = modelsQuery.data?.items ?? [];
 
   return (
     <div className="space-y-5">
       <PageHeader title={t("models.title")} description={t("models.description")} />
       <DataTableShell
-        toolbar={<span className="text-xs text-muted-foreground">{t("common.total", { count: items.length })}</span>}
+        toolbar={
+          <div className="flex w-full items-center justify-between gap-3">
+            <span className="text-xs text-muted-foreground">{t("common.total", { count: items.length })}</span>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={refreshMutation.isPending}
+              onClick={() => refreshMutation.mutate()}
+            >
+              {refreshMutation.isPending ? <Spinner className="size-3.5" /> : <RefreshCw />}
+              {t("models.refreshFromUpstream")}
+            </Button>
+          </div>
+        }
       >
         {modelsQuery.isPending ? (
           <div className="flex h-64 items-center justify-center">
@@ -62,32 +106,48 @@ export function ModelsPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {items.map((model) => (
-                <TableRow key={model.id}>
-                  <TableCell className="font-mono text-xs">{model.id}</TableCell>
-                  <TableCell className="font-mono text-[11px] text-muted-foreground">{model.upstream}</TableCell>
-                  <TableCell className="text-center">
-                    <span className={`inline-flex h-5 items-center rounded-full px-2 text-[11px] leading-none ${TYPE_TONE[model.type] ?? ""}`}>
-                      {model.type === "chat" ? t("models.typeChat") : model.type === "image" ? t("models.typeImage") : t("models.typeVideo")}
-                    </span>
-                  </TableCell>
-                  <TableCell className="text-xs">
-                    <p>{model.name}</p>
-                    <p className="mt-0.5 text-[10px] text-muted-foreground">{model.description}</p>
-                  </TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">{formatNumber(model.requests, i18n.language)}</TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">{formatTokens(model.tokens, i18n.language)}</TableCell>
-                  <TableCell>
-                    <div className="flex items-center justify-center gap-2">
-                      {model.builtin ? <Badge variant="outline">内置</Badge> : null}
-                      <Switch
-                        checked={model.enabled}
-                        onCheckedChange={(enabled) => updateMutation.mutate({ id: model.id, enabled })}
-                      />
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
+              {items.map((model) => {
+                const retired = model.unavailable;
+                return (
+                  <TableRow key={model.id} className={retired ? "opacity-60" : undefined}>
+                    <TableCell className={`font-mono text-xs ${retired ? "line-through" : ""}`}>{model.id}</TableCell>
+                    <TableCell className="font-mono text-[11px] text-muted-foreground">{model.upstreamModel || model.upstream}</TableCell>
+                    <TableCell className="text-center">
+                      <span className={`inline-flex h-5 items-center rounded-full px-2 text-[11px] leading-none ${TYPE_TONE[model.type] ?? ""}`}>
+                        {model.type === "chat" ? t("models.typeChat") : model.type === "image" ? t("models.typeImage") : t("models.typeVideo")}
+                      </span>
+                    </TableCell>
+                    <TableCell className="text-xs">
+                      <div className="flex items-center gap-2">
+                        <p className={retired ? "line-through" : ""}>{model.name}</p>
+                        {model.new ? (
+                          <Badge variant="outline" className="border-emerald-500/40 text-[10px] text-emerald-600 dark:text-emerald-400">
+                            {t("models.newBadge")}
+                          </Badge>
+                        ) : null}
+                        {retired ? (
+                          <Badge variant="outline" className="border-destructive/40 text-[10px] text-destructive">
+                            {t("models.unavailableBadge")}
+                          </Badge>
+                        ) : null}
+                      </div>
+                      <p className="mt-0.5 text-[10px] text-muted-foreground">{model.description}</p>
+                    </TableCell>
+                    <TableCell className="text-center text-xs tabular-nums">{formatNumber(model.requests, i18n.language)}</TableCell>
+                    <TableCell className="text-center text-xs tabular-nums">{formatTokens(model.tokens, i18n.language)}</TableCell>
+                    <TableCell>
+                      <div className="flex items-center justify-center gap-2">
+                        {model.builtin ? <Badge variant="outline">内置</Badge> : null}
+                        <Switch
+                          checked={model.enabled}
+                          disabled={retired}
+                          onCheckedChange={(enabled) => updateMutation.mutate({ id: model.id, enabled })}
+                        />
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
             </TableBody>
           </Table>
         )}

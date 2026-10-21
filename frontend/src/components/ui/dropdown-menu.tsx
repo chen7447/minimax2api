@@ -7,6 +7,7 @@ type DropdownContextValue = {
   open: boolean;
   setOpen: (open: boolean) => void;
   anchor: React.RefObject<HTMLDivElement | null>;
+  menu: React.RefObject<HTMLDivElement | null>;
 };
 
 const DropdownContext = React.createContext<DropdownContextValue | null>(null);
@@ -14,11 +15,20 @@ const DropdownContext = React.createContext<DropdownContextValue | null>(null);
 function DropdownMenu({ children }: { children: React.ReactNode }) {
   const [open, setOpen] = React.useState(false);
   const anchor = React.useRef<HTMLDivElement | null>(null);
+  const menu = React.useRef<HTMLDivElement | null>(null);
 
   React.useEffect(() => {
     if (!open) return;
     function onPointerDown(event: MouseEvent): void {
-      if (anchor.current && !anchor.current.contains(event.target as Node)) setOpen(false);
+      const target = event.target as Node;
+      // The menu is portalled to <body>, so it is never inside `anchor`. Without
+      // this second check every mousedown on an item reads as "outside": the
+      // menu unmounts on mousedown, and the browser then has no common ancestor
+      // left to deliver the click to — the item's onClick never runs, so the
+      // whole menu looks dead. (A synthetic `element.click()` skips mousedown
+      // entirely, which is why the render check never saw it.)
+      if (menu.current?.contains(target)) return;
+      if (anchor.current && !anchor.current.contains(target)) setOpen(false);
     }
     function onKeyDown(event: KeyboardEvent): void {
       if (event.key === "Escape") setOpen(false);
@@ -32,7 +42,7 @@ function DropdownMenu({ children }: { children: React.ReactNode }) {
   }, [open]);
 
   return (
-    <DropdownContext.Provider value={{ open, setOpen, anchor }}>
+    <DropdownContext.Provider value={{ open, setOpen, anchor, menu }}>
       <div ref={anchor} className="relative inline-flex">
         {children}
       </div>
@@ -74,6 +84,7 @@ function DropdownMenuContent({
   return createPortal(
     <div
       role="menu"
+      ref={context.menu}
       className={cn(
         "fixed z-50 min-w-44 overflow-hidden rounded-md border border-border/60 bg-popover p-1 text-popover-foreground shadow-lg animate-in fade-in-0 zoom-in-95",
         className,

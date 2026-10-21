@@ -59,6 +59,12 @@ const DefaultAgentID = ""
 // ErrInvalidCredential marks a token the upstream rejected.
 var ErrInvalidCredential = errors.New("minimax credential rejected")
 
+// ErrInsufficientBalance marks an account the upstream refused because its
+// balance cannot cover the request. The model endpoints signal this with a
+// real HTTP 402 (the conversation API instead streams the 50110 text inside a
+// 200, which the gateway reads out of the content).
+var ErrInsufficientBalance = errors.New("minimax insufficient balance")
+
 // ErrAgentIDUnknown marks an account whose agent id has not been resolved yet.
 //
 // It is separate from ErrInvalidCredential on purpose. Both look like "this
@@ -140,8 +146,11 @@ type Options struct {
 	Images       []UploadedImage
 	Timeout      time.Duration
 	IdleTimeout  time.Duration
-	OnDelta      func(string)
-	OnThinking   func(string)
+	// DisableThinking is set for public-pool turns (direct transport). The
+	// agent transport keeps its existing template-driven behaviour.
+	DisableThinking bool
+	OnDelta         func(string)
+	OnThinking      func(string)
 	// OnFrame sees every decoded frame, before anything decides what it means.
 	//
 	// Dispatch is driven by payload keys, which is what keeps the adapter
@@ -153,15 +162,28 @@ type Options struct {
 	DisableStream bool
 }
 
-// UploadedImage is a remote image reference forwarded to the agent.
+// UploadedImage is one image attached to a turn.
 //
-// MiniMax's attachment pipeline needs a signed upload we cannot reproduce from
-// the outside, so images are passed through by URL and resolved upstream.
+// It is a *source* until ResolveImages gives it an object key. The message
+// endpoint only accepts an image the sending account owns, so the image is
+// carried as the bytes the caller supplied and uploaded — with the account that
+// will send it — before the body is built. The key belongs to that account,
+// which is why resolution is per attempt rather than once up front: a retry on
+// another account must upload again.
 type UploadedImage struct {
-	URL    string
-	Name   string
-	Width  int
-	Height int
+	// Data is the image as supplied inline. A resolved image keeps the bytes
+	// and gains an ObjectKey.
+	Data []byte
+	// FileName and MimeType describe the bytes. Filled from the data URI when
+	// the caller did not supply them.
+	FileName string
+	MimeType string
+	// ObjectKey is the account-owned key the attachment carries. Filled by
+	// ResolveImages.
+	ObjectKey string
+	SizeBytes int
+	Width     int
+	Height    int
 }
 
 // Client talks to the MiniMax Agent web API.
@@ -185,11 +207,21 @@ func (c *Client) clock() time.Time {
 
 // New builds a client. settingsFn is re-read on every request so runtime
 // configuration changes apply without a restart.
+//
+// Compression is off, and that is load-bearing rather than a preference. Go's
+// transport advertises `Accept-Encoding: gzip` on its own when nothing sets the
+// header, and this upstream reacts to that advertisement by buffering the whole
+// stream so it can compress it — measured 2026-10-06: a 400-word answer arrived
+// as two reads at 8.9s instead of 277 reads spread over 9.5s. A streaming
+// endpoint that buffers is not a streaming endpoint, and the symptom is easy to
+// misread as the model being slow. Streaming requests also send `identity`
+// explicitly, so the intent survives any future transport configuration.
 func New(settingsFn func() config.Settings) *Client {
 	transport := &http.Transport{
 		MaxIdleConns:        128,
 		MaxIdleConnsPerHost: 32,
 		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true,
 	}
 	return &Client{
 		http: &http.Client{
@@ -432,6 +464,12 @@ func (c *Client) newRequest(ctx context.Context, settings config.Settings, cred 
 	req.Header.Set("referer", c.baseURL(settings, cred)+"/")
 	req.Header.Set("user-agent", settings.Upstream.UserAgent)
 
+	// A streaming turn must not be compressed. See New: advertising gzip makes
+	// this upstream hold the whole stream back until it ends.
+	if target.Stream {
+		req.Header.Set("accept-encoding", "identity")
+	}
+
 	// The three headers the web bundle attaches to every API call.
 	req.Header.Set("token", cred.Token)
 	req.Header.Set("x-timestamp", strconv.FormatInt(now.Unix(), 10))
@@ -619,6 +657,17 @@ func (c *Client) Completion(ctx context.Context, opts Options) (*Result, error) 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Upload before opening the session: an image that cannot be stored is a
+	// request that cannot succeed, and failing here leaves no empty session
+	// behind for the caller to pay for.
+	if len(opts.Images) > 0 {
+		resolved, err := c.ResolveImages(ctx, opts.Credential, opts.Images)
+		if err != nil {
+			return nil, err
+		}
+		opts.Images = resolved
+	}
+
 	sessionID, err := c.CreateSession(ctx, opts.Credential)
 	if err != nil {
 		return nil, err
@@ -659,6 +708,9 @@ func (c *Client) sendMessage(ctx context.Context, opts Options, sessionID string
 	}
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if resp.StatusCode == http.StatusPaymentRequired {
+			return nil, fmt.Errorf("%w: minimax message HTTP 402: %s", ErrInsufficientBalance, snippet(body))
+		}
 		return nil, fmt.Errorf("minimax message HTTP %d: %s", resp.StatusCode, snippet(body))
 	}
 
@@ -688,9 +740,13 @@ func buildMessageBody(settings config.Settings, opts Options, turnID string) map
 		attachments := make([]any, 0, len(opts.Images))
 		for _, image := range opts.Images {
 			attachments = append(attachments, map[string]any{
-				"type": "image",
-				"url":  image.URL,
-				"name": image.Name,
+				"meta": map[string]any{
+					"attachment_type": "image",
+					"file_name":       image.FileName,
+					"mime_type":       image.MimeType,
+					"size_bytes":      image.SizeBytes,
+				},
+				"cloud": map[string]any{"object_key": image.ObjectKey},
 			})
 		}
 		body["attachments"] = attachments
@@ -1082,10 +1138,18 @@ func dedupeMedia(items []MediaRef) []MediaRef {
 
 // ------------------------------------------------------------------- probe
 
-// Probe validates a credential by opening a session and immediately discarding
-// it. Creating a session is the cheapest authenticated call available: it
-// proves the token and fingerprint pair is accepted without spending a
+// Probe validates a credential by making the cheapest authenticated call the
+// selected transport offers.
+//
+// On the agent transport that is opening a session and immediately discarding
+// it: it proves the token and fingerprint pair is accepted without spending a
 // conversation turn.
+//
+// On the direct transport there is no session to open, and the equivalent is a
+// one-token turn against a model every account has. The model list looks
+// cheaper, but it is not a credential check in any sense that can be relied on
+// — a catalogue that answers 200 for an anonymous caller would make every
+// account look healthy, which is the failure this function exists to catch.
 func (c *Client) Probe(ctx context.Context, cred Credential) (int64, error) {
 	started := time.Now()
 	settings := c.settings()
@@ -1095,6 +1159,19 @@ func (c *Client) Probe(ctx context.Context, cred Credential) (int64, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
+	if settings.UsesDirectModelAPI() {
+		if _, err := c.Messages(ctx, DirectOptions{
+			Credential:    cred,
+			Model:         DefaultDirectProbeModel,
+			Messages:      []DirectMessage{{Role: "user", Content: json.RawMessage(`"ping"`)}},
+			MaxTokens:     16,
+			DisableStream: true,
+		}); err != nil {
+			return 0, err
+		}
+		return time.Since(started).Milliseconds(), nil
+	}
 
 	if _, err := c.CreateSession(ctx, cred); err != nil {
 		return 0, err

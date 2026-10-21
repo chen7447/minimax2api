@@ -2,7 +2,9 @@ package signin
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +34,16 @@ type stubClient struct {
 	grants []minimax.CreditGrant
 	// grantsErr makes the grant read fail.
 	grantsErr error
+	// renewToken is what RenewToken hands back; empty means the renewal
+	// returns a fresh, well-formed JWT with exp in renewFutureDays.
+	renewToken string
+	// renewErr makes the renewal fail.
+	renewErr error
+	// renewCall counts renewal invocations.
+	renewCall int
+	// lastRenewed records the token the last successful renewal returned, so
+	// a test can assert persistence against exactly what was handed over.
+	lastRenewed string
 	// prepared records that the opening sequence ran, and calls records the
 	// order of every upstream call so the sequence can be asserted rather than
 	// assumed.
@@ -56,6 +68,33 @@ func (s *stubClient) CreditGrants(context.Context, minimax.Credential) ([]minima
 		return nil, s.grantsErr
 	}
 	return s.grants, nil
+}
+
+// renewFutureDays is how far out the stub's default renewed token expires —
+// comfortably past the renewal skew window, so one renewal quiets the account.
+const renewFutureDays = 40
+
+func (s *stubClient) RenewToken(context.Context, minimax.Credential) (string, error) {
+	s.note("renew")
+	s.renewCall++
+	if s.renewErr != nil {
+		return "", s.renewErr
+	}
+	if s.renewToken != "" {
+		s.lastRenewed = s.renewToken
+		return s.renewToken, nil
+	}
+	s.lastRenewed = testJWT(time.Now().Add(renewFutureDays * 24 * time.Hour))
+	return s.lastRenewed, nil
+}
+
+// testJWT mints an unsigned-claim JWT carrying just the exp the renewal loop
+// schedules by. The signature segment is filler: nothing in this package
+// verifies it — that is the upstream's job.
+func testJWT(exp time.Time) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256"}`))
+	body := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, exp.Unix())))
+	return header + "." + body + ".sig"
 }
 
 func (s *stubClient) SigninStatus(context.Context, minimax.Credential) (*minimax.SigninPanel, error) {
@@ -153,10 +192,12 @@ func defaultSettings() *config.Settings {
 
 // TestNextRunCatchesUpAMissedSlot pins the behaviour that makes the scheduler
 // worth having: a machine that was asleep at the scheduled minute must still
-// check in when it wakes, rather than silently losing the day.
+// check in when it wakes, rather than silently losing the day. It runs against
+// the legacy fixed slot (empty seed), where the instants are hand-checkable.
 func TestNextRunCatchesUpAMissedSlot(t *testing.T) {
 	settings := defaultSettings()
 	f := newFixture(t, settings)
+	f.service.slotSeed = "" // legacy fixed 09:05 slot
 
 	// 08:00, before the 09:05 slot: wait for it.
 	at := time.Date(2026, 9, 18, 8, 0, 0, 0, time.Local)
@@ -171,13 +212,122 @@ func TestNextRunCatchesUpAMissedSlot(t *testing.T) {
 		t.Errorf("a missed slot should be due immediately, got %v", got)
 	}
 
-	// Mark today as served, then the next slot is tomorrow.
-	f.store.SaveAccountState(f.account.ID, func(target *store.Account) {
-		target.SigninAt = time.Date(2026, 9, 18, 15, 0, 30, 0, time.Local)
-	})
+	// A completed sweep consumes the day, then the next slot is tomorrow.
+	f.store.MarkSigninSwept(time.Date(2026, 9, 18, 15, 0, 30, 0, time.Local))
 	want = time.Date(2026, 9, 19, 9, 5, 0, 0, time.Local)
 	if got := f.service.NextRun(at); !got.Equal(want) {
 		t.Errorf("after a served day NextRun = %v, want %v", got, want)
+	}
+}
+
+// TestQueueSigninDoesNotCountAsSwept is the regression that motivated the
+// State-level stamp: a fresh account's queue check-in stamps SigninAt at any
+// hour, and the old sweptOn read that field — so a day with one fresh account
+// signed in read as fully swept and the real sweep skipped to tomorrow.
+func TestQueueSigninDoesNotCountAsSwept(t *testing.T) {
+	f := newFixture(t, defaultSettings())
+
+	// Someone signed in today, but no sweep ran.
+	f.store.SaveAccountState(f.account.ID, func(target *store.Account) {
+		target.SigninAt = time.Now().Add(-time.Hour)
+	})
+
+	at := time.Now().Add(25 * time.Hour) // tomorrow's probe, well past today's slot
+	// Tomorrow has no swept stamp either way; what matters is today: probing
+	// today, after today's slot, must still read as due.
+	now := time.Now()
+	if now.Before(f.service.slotOn(now)) {
+		t.Skip("slot has not passed yet today; the catch-up branch is untestable in this window")
+	}
+	if got := f.service.NextRun(now); !got.Equal(now) {
+		t.Errorf("a day with only queue sign-ins must still be swept, NextRun = %v", got)
+	}
+	_ = at
+}
+
+// TestRandomSlotIsDeterministicPerDayAndVariesAcrossDays pins the randomized
+// schedule: the same day always derives the same instant (restarts must not
+// move it), different days derive different ones (no fixed pattern to spot),
+// and every instant stays inside the Beijing-day window that keeps two slots
+// from landing in one upstream day.
+func TestRandomSlotIsDeterministicPerDayAndVariesAcrossDays(t *testing.T) {
+	f := newFixture(t, defaultSettings())
+	if f.service.slotSeed == "" {
+		t.Fatal("fixture should carry a slot seed")
+	}
+
+	beijing := config.BeijingZone()
+	seen := map[string]bool{}
+	var last time.Duration
+	for i := 0; i < 30; i++ {
+		day := time.Date(2026, 10, 1+i, 12, 0, 0, 0, beijing)
+		slot := f.service.slotOn(day)
+		offset := time.Duration(slot.Hour())*time.Hour + time.Duration(slot.Minute())*time.Minute + time.Duration(slot.Second())*time.Second
+
+		// Deterministic: a second derivation for the same day agrees to the
+		// minute.
+		if again := f.service.slotOn(day); !again.Equal(slot) {
+			t.Fatalf("day %d: slot not deterministic: %v vs %v", i+1, slot, again)
+		}
+		// Window: 08:00–24:00 Beijing on that day's midnight.
+		midnight := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, beijing)
+		if slot.Before(midnight.Add(8*time.Hour)) || !slot.Before(midnight.Add(24*time.Hour)) {
+			t.Fatalf("day %d: slot %v outside the 08:00–24:00 window", i+1, slot)
+		}
+		if offset == last {
+			t.Errorf("day %d: slot repeats the previous day's instant (%v)", i+1, offset)
+		}
+		seen[offset.String()] = true
+		last = offset
+	}
+	// "Random" here means not predictable day-to-day; thirty days that
+	// collapsed into a handful of instants would still be a pattern.
+	if len(seen) < 25 {
+		t.Errorf("thirty days produced only %d distinct instants", len(seen))
+	}
+}
+
+// TestSweptStampSurvivesRestart pins the catch-up marker to the store: a
+// completed sweep's stamp must be readable after a fresh Service over the same
+// data directory, because the marker is exactly what stops a restart from
+// re-sweeping a served day — or, in the failure direction, what lets a day
+// whose sweep died mid-walk be retried at all.
+func TestSweptStampSurvivesRestart(t *testing.T) {
+	f := newFixture(t, defaultSettings())
+	f.service.Sweep(context.Background())
+
+	// Close first: the store persists on a debounce, and reopening the file
+	// before the flush lands would read the pre-sweep state — in production
+	// the same order holds, since a restart implies the old process exited.
+	// The fixture's own cleanup would panic double-closing it, so disarm it.
+	_ = f.store.Close()
+
+	reopened, err := store.Open(f.store.DataDir(), "admin", "admin12345")
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	if reopened.SigninSweptAt().IsZero() {
+		t.Fatal("the swept stamp should have been persisted")
+	}
+	// And the day now reads as served to a new scheduler over the same data:
+	// probing three hours ahead must land on tomorrow's slot, whatever minute
+	// the day's randomized draw picked. The randomized window can put that slot
+	// as early as 08:00 Beijing, i.e. well under 20h from a late-evening probe,
+	// so the assertion checks the calendar day rather than a fixed distance.
+	svc := New(reopened, f.client, func() config.Settings { return *defaultSettings() },
+		func(account *store.Account) minimax.Credential { return minimax.Credential{} })
+	probe := time.Now().Add(3 * time.Hour)
+	got := svc.NextRun(probe)
+	// The calendar day, not a fixed distance: an early draw (08:00 Beijing) is
+	// under 12h from a late-evening probe, and a late draw is over 20h from an
+	// early one, so any single distance bound rejects a valid slot.
+	wantDay := time.Now().In(config.BeijingZone()).AddDate(0, 0, 1)
+	gy, gm, gd := got.In(config.BeijingZone()).Date()
+	wy, wm, wd := wantDay.Date()
+	if !got.After(probe) || gy != wy || gm != wm || gd != wd {
+		t.Errorf("a served day should schedule tomorrow's slot, NextRun = %v (probe %v)", got, probe)
 	}
 }
 
@@ -517,7 +667,10 @@ func TestClaimWaitsForTheOpeningSequence(t *testing.T) {
 
 	f.service.Sweep(context.Background())
 
-	want := "prepare,status,claim,credit"
+	// The grant breakdown rides the same poller pass as the balance read, so
+	// it lands right after `credit` — still behind the claim, never in front
+	// of the opening sequence.
+	want := "prepare,status,claim,credit,grants"
 	if got := strings.Join(f.client.calls, ","); got != want {
 		t.Errorf("upstream call order = %q, want %q", got, want)
 	}
@@ -686,5 +839,168 @@ func TestReconcileIgnoresAReadFailure(t *testing.T) {
 	}
 	if updated.SigninError != "" {
 		t.Errorf("a failed read must not write a note, got %q", updated.SigninError)
+	}
+}
+
+// applyCredit is the credit-activation recovery: an exhausted account revives
+// the moment a balance reading above zero lands, from whichever source.
+func TestApplyCreditRevivesExhaustedAccount(t *testing.T) {
+	target := &store.Account{
+		Name:        "acc",
+		Status:      store.StatusExhausted,
+		ExhaustedAt: time.Now().Add(-2 * time.Hour),
+		LastError:   "upstream quota drained",
+	}
+
+	applyCredit(target, &minimax.CreditInfo{Total: 800})
+	if target.Status != store.StatusActive || target.ExhaustedAt.IsZero() == false || target.LastError != "" {
+		t.Fatalf("revive = status %q exhaustedAt zero %v lastError %q, want active/cleared/cleared",
+			target.Status, target.ExhaustedAt.IsZero(), target.LastError)
+	}
+	if target.Credit == nil || target.Credit.Total != 800 {
+		t.Fatalf("credit = %+v, want total 800", target.Credit)
+	}
+
+	// A flat balance keeps the account exhausted, and a fresh reading never
+	// touches an account in any other state.
+	exhausted := &store.Account{Status: store.StatusExhausted, ExhaustedAt: time.Now()}
+	applyCredit(exhausted, &minimax.CreditInfo{Total: 0})
+	if exhausted.Status != store.StatusExhausted || exhausted.ExhaustedAt.IsZero() {
+		t.Fatal("flat balance must not revive an exhausted account")
+	}
+	active := &store.Account{Status: store.StatusCooldown}
+	applyCredit(active, &minimax.CreditInfo{Total: 100})
+	if active.Status != store.StatusCooldown {
+		t.Fatal("credit reading must not flip a non-exhausted status")
+	}
+}
+
+// --- token renewal ----------------------------------------------------------
+
+// expSoon swaps the account's token for one expiring d from now, inside (or
+// outside, for the negative case) the renewal window.
+func expSoon(t *testing.T, f *fixture, d time.Duration) {
+	t.Helper()
+	f.store.SaveAccountState(f.account.ID, func(target *store.Account) {
+		target.Token = testJWT(time.Now().Add(d))
+	})
+}
+
+// renewTokenUsed reports the token the stub last produced, so a test can
+// assert persistence against exactly what the renewal returned.
+func (s *stubClient) renewTokenUsed() string { return s.lastRenewed }
+
+// TestRenewPassSwapsExpiringToken pins the happy path: a token inside the skew
+// window is exchanged, the new token and both lifecycle stamps land on the
+// account, and a token with time to spare is left alone. The dedup window then
+// holds an immediate second pass off the account it just served.
+func TestRenewPassSwapsExpiringToken(t *testing.T) {
+	f := newFixture(t, defaultSettings())
+
+	f.service.renewPass(context.Background())
+	if f.client.renewCall != 0 {
+		t.Fatalf("a token outside the window must not be renewed, calls = %d", f.client.renewCall)
+	}
+
+	expSoon(t, f, 24*time.Hour)
+	if !f.service.renewPass(context.Background()) {
+		t.Fatal("renewPass reported context death on a live context")
+	}
+	if f.client.renewCall != 1 {
+		t.Fatalf("renew calls = %d, want 1", f.client.renewCall)
+	}
+	account, _ := f.store.AccountByID(f.account.ID)
+	if account.Token != f.client.renewTokenUsed() {
+		t.Error("the fresh token should be persisted")
+	}
+	if account.TokenRenewedAt.IsZero() || account.TokenRenewExp.IsZero() {
+		t.Error("both lifecycle stamps should be written")
+	}
+
+	f.service.renewPass(context.Background())
+	if f.client.renewCall != 1 {
+		t.Errorf("the dedup window must suppress an immediate second renewal, calls = %d", f.client.renewCall)
+	}
+}
+
+// TestRenewFailureLeavesTokenUntouched is the safety half: a rejected renewal
+// must not clear the token, stamp the renewal (that would suppress the retry),
+// or disturb the account's health.
+func TestRenewFailureLeavesTokenUntouched(t *testing.T) {
+	f := newFixture(t, defaultSettings())
+	expSoon(t, f, 24*time.Hour)
+	before, _ := f.store.AccountByID(f.account.ID)
+	oldToken := before.Token
+
+	f.client.renewErr = errors.New("upstream renewal 403")
+
+	if !f.service.renewPass(context.Background()) {
+		t.Fatal("renewPass reported context death on a live context")
+	}
+	if f.client.renewCall != 1 {
+		t.Fatalf("renew calls = %d, want 1", f.client.renewCall)
+	}
+	account, _ := f.store.AccountByID(f.account.ID)
+	if account.Token != oldToken {
+		t.Error("a failed renewal must not touch the stored token")
+	}
+	if !account.TokenRenewedAt.IsZero() {
+		t.Error("a failed renewal must not stamp TokenRenewedAt — that would suppress the retry")
+	}
+	if account.Status != store.StatusActive {
+		t.Errorf("a renewal failure is not an account health event, status = %q", account.Status)
+	}
+}
+
+// TestRenewOnePersistsFreshToken covers the console's per-account path: the
+// returned expiry is the new token's, and an unparseable response is refused
+// rather than stored.
+func TestRenewOnePersistsFreshToken(t *testing.T) {
+	t.Run("stores the fresh token and returns its exp", func(t *testing.T) {
+		f := newFixture(t, defaultSettings())
+		want := time.Now().Add(15 * 24 * time.Hour).Truncate(time.Second)
+		f.client.renewToken = testJWT(want)
+
+		exp, err := f.service.RenewOne(context.Background(), f.account.ID)
+		if err != nil {
+			t.Fatalf("RenewOne: %v", err)
+		}
+		if !exp.Equal(want) {
+			t.Errorf("exp = %v, want %v", exp, want)
+		}
+		account, _ := f.store.AccountByID(f.account.ID)
+		if account.Token != f.client.renewToken {
+			t.Error("the fresh token should be persisted")
+		}
+	})
+
+	t.Run("refuses a response without a parsable exp", func(t *testing.T) {
+		f := newFixture(t, defaultSettings())
+		f.client.renewToken = "not-a-jwt"
+
+		if _, err := f.service.RenewOne(context.Background(), f.account.ID); err == nil {
+			t.Fatal("an unparseable renewal answer must be refused")
+		}
+		account, _ := f.store.AccountByID(f.account.ID)
+		if account.Token == "not-a-jwt" {
+			t.Error("an unparsable token must not be stored — the loop could no longer schedule it")
+		}
+	})
+}
+
+// TestTokenExpiryReadsTheClaim checks the scheduler's decoder on shapes it
+// will actually meet: the renewal endpoint's JWT, a garbage string, and a
+// token without exp.
+func TestTokenExpiryReadsTheClaim(t *testing.T) {
+	want := time.Now().Add(72 * time.Hour).Truncate(time.Second)
+	if got := tokenExpiry(testJWT(want)); !got.Equal(want) {
+		t.Errorf("exp = %v, want %v", got, want)
+	}
+	if !tokenExpiry("garbage").IsZero() {
+		t.Error("a non-JWT string must report zero")
+	}
+	noExp := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"x"}`))
+	if !tokenExpiry("h." + noExp + ".s").IsZero() {
+		t.Error("a JWT without exp must report zero")
 	}
 }

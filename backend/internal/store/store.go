@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,6 +53,13 @@ type Store struct {
 
 	settings atomic.Value // config.Settings
 
+	// slotSeed memoizes SigninSlotSeed; see there.
+	slotSeedOnce sync.Once
+	slotSeed     string
+
+	// closeOnce makes Close idempotent; see there.
+	closeOnce sync.Once
+
 	dirty  chan struct{}
 	flush  chan chan error
 	closed chan struct{}
@@ -59,7 +67,7 @@ type Store struct {
 }
 
 // Open loads (or initialises) the persistent store inside dataDir.
-func Open(dataDir, adminUser, adminPassword string) (*Store, error) {
+func Open(dataDir, adminUser, adminKey string) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
@@ -112,20 +120,20 @@ func Open(dataDir, adminUser, adminPassword string) (*Store, error) {
 		if adminUser == "" {
 			adminUser = "admin"
 		}
-		password := adminPassword
+		key := adminKey
 		generated := false
-		if password == "" {
-			password = randomToken(12)
+		if key == "" {
+			key = "mm2api-" + randomToken(16)
 			generated = true
 		}
 		salt := randomToken(16)
-		store.state.Admin = Admin{Username: adminUser, Salt: salt, PasswordHash: hashPassword(password, salt)}
+		store.state.Admin = Admin{Username: adminUser, Salt: salt, KeyHash: hashPassword(key, salt)}
 		store.state.Settings.Server.AdminUsername = adminUser
 		if err := store.writeSnapshotLocked(); err != nil {
 			return nil, err
 		}
 		if generated {
-			fmt.Printf("\n  ⚠ 已生成初始管理员密码：%s\n  用户名：%s\n  请登录后立即在「设置」中修改。\n\n", password, adminUser)
+			fmt.Printf("\n  ⚠ 已生成初始管理员密钥：%s\n  管理台登录与 /admin/api/* 都用这一把 key，请立即在「设置」里改掉并留底。\n\n", key)
 		}
 	}
 	if err := os.MkdirAll(store.state.Settings.Media.GeneratedDir, 0o755); err != nil {
@@ -241,15 +249,20 @@ func (s *Store) Save() error {
 	}
 }
 
-// Close performs a final flush and stops the background writer.
+// Close performs a final flush and stops the background writer. Safe to call
+// twice: a second call returns after the first one's flush, rather than
+// panicking on the already-closed channel — a restart path that closes an old
+// handle and a shutdown hook may both get there.
 func (s *Store) Close() error {
-	reply := make(chan error, 1)
-	select {
-	case s.flush <- reply:
-		<-reply
-	default:
-	}
-	close(s.closed)
+	s.closeOnce.Do(func() {
+		reply := make(chan error, 1)
+		select {
+		case s.flush <- reply:
+			<-reply
+		default:
+		}
+		close(s.closed)
+	})
 	s.wg.Wait()
 	return nil
 }
@@ -276,26 +289,33 @@ func randomToken(bytes int) string {
 	return hex.EncodeToString(buf)
 }
 
-func (s *Store) VerifyPassword(username, password string) bool {
+// VerifyKey reports whether key is the admin key. There is deliberately no
+// username argument: one secret gates both the console and the admin API.
+func (s *Store) VerifyKey(key string) bool {
+	if key == "" {
+		return false
+	}
 	s.mu.RLock()
 	admin := s.state.Admin
 	s.mu.RUnlock()
-	if admin.Username == "" || subtle.ConstantTimeCompare([]byte(admin.Username), []byte(username)) != 1 {
+	if admin.KeyHash == "" || admin.Salt == "" {
 		return false
 	}
-	expected := hashPassword(password, admin.Salt)
-	return subtle.ConstantTimeCompare([]byte(expected), []byte(admin.PasswordHash)) == 1
+	expected := hashPassword(key, admin.Salt)
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(admin.KeyHash)) == 1
 }
 
-func (s *Store) SetPassword(username, password string) error {
-	if len(password) < 8 {
-		return errors.New("密码至少 8 位")
+// SetKey replaces the admin key. Sessions are not touched here; a caller that
+// wants them dropped (the change-key handler) revokes them explicitly.
+func (s *Store) SetKey(key string) error {
+	if len(key) < 8 {
+		return errors.New("密钥至少 8 位")
 	}
 	s.mu.Lock()
 	defer s.unlockAndNotify()
 	salt := randomToken(16)
-	s.state.Admin = Admin{Username: username, Salt: salt, PasswordHash: hashPassword(password, salt)}
-	s.state.Settings.Server.AdminUsername = username
+	s.state.Admin.Salt = salt
+	s.state.Admin.KeyHash = hashPassword(key, salt)
 	s.markDirtyLocked()
 	return nil
 }
@@ -304,6 +324,52 @@ func (s *Store) AdminProfile() Admin {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.state.Admin
+}
+
+// SigninSlotSeed returns the seed the randomized check-in slot is derived from,
+// issuing and persisting it on first use.
+//
+// Installs that predate the feature have no seed in their settings; baking
+// issuance into boot would touch the disk on a read path, so the first call
+// settles it: the admin salt where one exists (already a stable per-install
+// random value), a fresh random token otherwise. The chosen value is written
+// back into the settings so it survives the store file, not just the process —
+// a restart must not move today's slot, and the scheduler calls this from
+// whatever process happens to be running.
+func (s *Store) SigninSlotSeed() string {
+	s.slotSeedOnce.Do(func() {
+		seed := s.Settings().Signin.SlotSeed
+		if seed == "" {
+			if salt := s.AdminProfile().Salt; salt != "" {
+				seed = salt
+			} else {
+				seed = randomToken(16)
+			}
+			_ = s.UpdateSettings(func(c *config.Settings) {
+				c.Signin.SlotSeed = seed
+			})
+		}
+		s.slotSeed = seed
+	})
+	return s.slotSeed
+}
+
+// SigninSweptAt reports when the daily sweep last completed, if ever.
+func (s *Store) SigninSweptAt() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.SigninSweptAt
+}
+
+// MarkSigninSwept records the completion of a full-pool sweep. The stamp drives
+// the scheduler's catch-up decision, so it must land on disk: a stamp that only
+// lived in memory would let a restart re-sweep an already served day, which is
+// harmless once a day but a full second walk of the pool every boot.
+func (s *Store) MarkSigninSwept(at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.SigninSweptAt = at
+	s.markDirtyLocked()
 }
 
 // IssueSession creates an admin session token.
@@ -488,8 +554,12 @@ func (s *Store) UpdateAccount(id string, apply func(*Account)) (*Account, error)
 		account.UpdatedAt = time.Now()
 		if !account.Enabled {
 			account.Status = StatusDisabled
-		} else if account.Status == StatusDisabled {
+		} else if account.Status == StatusDisabled || account.Status == StatusExhausted {
+			// Re-enabling (or explicitly re-saving) an exhausted account is a
+			// manual revive: the operator is saying the balance question is
+			// settled, so the marker goes with the status.
 			account.Status = StatusActive
+			account.ExhaustedAt = time.Time{}
 		}
 		s.markDirtyLocked()
 		return account, nil
@@ -579,8 +649,12 @@ func (s *Store) UpdateAccounts(ids []string, apply func(*Account)) (int, error) 
 		account.UpdatedAt = now
 		if !account.Enabled {
 			account.Status = StatusDisabled
-		} else if account.Status == StatusDisabled {
+		} else if account.Status == StatusDisabled || account.Status == StatusExhausted {
+			// Re-enabling (or explicitly re-saving) an exhausted account is a
+			// manual revive: the operator is saying the balance question is
+			// settled, so the marker goes with the status.
 			account.Status = StatusActive
+			account.ExhaustedAt = time.Time{}
 		}
 		updated++
 	}
@@ -646,6 +720,12 @@ func (s *Store) ClientKeyByValue(value string) (*ClientKey, bool) {
 }
 
 func (s *Store) CreateClientKey(name string, rpm, maxConcurrent int) (*ClientKey, error) {
+	return s.CreateClientKeyWithPool(name, rpm, maxConcurrent, "")
+}
+
+// CreateClientKeyWithPool creates a key bound to an account pool
+// ("" = personal, "gongyi" = public welfare).
+func (s *Store) CreateClientKeyWithPool(name string, rpm, maxConcurrent int, pool string) (*ClientKey, error) {
 	s.mu.Lock()
 	defer s.unlockAndNotify()
 	key := &ClientKey{
@@ -655,11 +735,61 @@ func (s *Store) CreateClientKey(name string, rpm, maxConcurrent int) (*ClientKey
 		Enabled:       true,
 		RPMLimit:      rpm,
 		MaxConcurrent: maxConcurrent,
+		Pool:          normalizePool(pool),
 		CreatedAt:     time.Now(),
 	}
 	s.state.ClientKeys = append(s.state.ClientKeys, key)
 	s.markDirtyLocked()
 	return key, nil
+}
+
+// normalizePool collapses unknown pool names to "".
+func normalizePool(pool string) string {
+	if strings.EqualFold(strings.TrimSpace(pool), "gongyi") {
+		return "gongyi"
+	}
+	return ""
+}
+
+// SetGongyiBatch marks accounts as public-pool members in one write. replace
+// clears the flag on every account not in ids.
+func (s *Store) SetGongyiBatch(ids map[string]bool, replace bool) int {
+	s.mu.Lock()
+	defer s.unlockAndNotify()
+	n := 0
+	for _, account := range s.state.Accounts {
+		if replace {
+			account.Gongyi = ids[account.ID]
+		} else if ids[account.ID] {
+			account.Gongyi = true
+		}
+		if account.Gongyi {
+			n++
+		}
+	}
+	s.markDirtyLocked()
+	return n
+}
+
+// GongyiAccounts returns a detached snapshot of public-pool accounts.
+func (s *Store) GongyiAccounts() []*Account {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*Account, 0, 64)
+	for _, account := range s.state.Accounts {
+		if account.Gongyi {
+			out = append(out, account.clone())
+		}
+	}
+	return out
+}
+
+// SetClientKeyPool binds a client key to a pool.
+func (s *Store) SetClientKeyPool(id, pool string) bool {
+	_, err := s.UpdateClientKey(id, func(key *ClientKey) {
+		key.Pool = normalizePool(pool)
+	})
+	return err == nil
 }
 
 func (s *Store) UpdateClientKey(id string, apply func(*ClientKey)) (*ClientKey, error) {
@@ -706,19 +836,65 @@ func (s *Store) BumpClientKeyUsage(id string) {
 
 // -------------------------------------------------------------------- models
 
+// ListModels returns the visible catalogue in console order: entries the last
+// refresh added first, ordinary entries next, unavailable entries last.
+//
+// The order is the console's lifecycle made visible: a new model appears at the
+// top with a badge, and a model the upstream stopped serving drops to the
+// bottom, struck through, until the next refresh removes it. Removed entries are
+// tombstones and never appear.
 func (s *Store) ListModels() []*ModelConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]*ModelConfig, len(s.state.Models))
-	copy(out, s.state.Models)
+	out := make([]*ModelConfig, 0, len(s.state.Models))
+	for _, model := range s.state.Models {
+		if model == nil || model.Removed {
+			continue
+		}
+		out = append(out, model)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		group := func(model *ModelConfig) int {
+			switch {
+			case model.New:
+				return 0
+			case model.Unavailable:
+				return 2
+			default:
+				return 1
+			}
+		}
+		gi, gj := group(out[i]), group(out[j])
+		if gi != gj {
+			return gi < gj
+		}
+		if gi == 2 {
+			// Unavailable entries keep their previous relative order.
+			return false
+		}
+		// Within a group, follow the upstream's own model order. Unranked
+		// entries (the registry does not list them) come after ranked ones.
+		const unranked = int(^uint(0) >> 1)
+		ri, rj := out[i].Rank, out[j].Rank
+		if ri == 0 {
+			ri = unranked
+		}
+		if rj == 0 {
+			rj = unranked
+		}
+		return ri < rj
+	})
 	return out
 }
 
+// ModelByID finds a live catalogue entry. Removed entries are invisible; an
+// unavailable one is still returned so the caller can refuse it with a message
+// that explains why, instead of "unknown model".
 func (s *Store) ModelByID(id string) (*ModelConfig, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, model := range s.state.Models {
-		if model.ID == id {
+		if model.ID == id && !model.Removed {
 			return model, true
 		}
 	}
