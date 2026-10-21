@@ -2,7 +2,7 @@
 """MiniMax2API end-to-end smoke test.
 
 Usage:
-    python tools/smoke.py [--base http://127.0.0.1:8080] [--password admin12345]
+    python tools/smoke.py [--base http://127.0.0.1:8080] [--key admin12345]
 
 Checks the admin console API, the OpenAI-compatible surface and the audit
 pipeline. It never touches the real upstream unless an account with a valid
@@ -65,8 +65,7 @@ def check(name, condition, detail=""):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:8080")
-    parser.add_argument("--username", default="admin")
-    parser.add_argument("--password", default="admin12345")
+    parser.add_argument("--key", default="admin12345")
     parser.add_argument(
         "--skip-upstream",
         action="store_true",
@@ -87,7 +86,7 @@ def main():
 
     print("\n2. admin auth")
     status, payload = call(base, "/admin/api/auth/login", "POST",
-                           {"username": args.username, "password": args.password})
+                           {"key": args.key})
     check("login returns 200", status == 200, f"status={status} {payload}")
     token = payload.get("token", "")
     check("login returns a token", bool(token))
@@ -95,7 +94,7 @@ def main():
         return finish()
 
     status, payload = call(base, "/admin/api/auth/me", token=token)
-    check("GET /auth/me returns the profile", status == 200 and payload.get("username") == args.username)
+    check("GET /auth/me returns the profile", status == 200 and bool(payload.get("username")))
 
     status, _ = call(base, "/admin/api/accounts")
     check("unauthenticated admin call is rejected", status == 401, f"status={status}")

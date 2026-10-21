@@ -1,0 +1,18 @@
+[Unit]
+Description=MiniMax2API gateway (OpenAI/Anthropic compatible)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=minimax2api
+Group=minimax2api
+WorkingDirectory=/opt/minimax2api
+EnvironmentFile=/opt/minimax2api/env
+ExecStart=/opt/minimax2api/minimax2api -addr 127.0.0.1:8080 -static dist
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

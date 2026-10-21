@@ -12,7 +12,7 @@
  *          --user-data-dir=<temp dir> about:blank
  *
  * Usage:
- *   node tools/render.mjs [base] [cdp] [password] [screenshot-dir]
+ *   node tools/render.mjs [base] [cdp] [key] [screenshot-dir]
  */
 
 import fs from "node:fs";
@@ -20,7 +20,7 @@ import path from "node:path";
 
 const BASE = (process.argv[2] || "http://127.0.0.1:8080").replace(/\/$/, "");
 const CDP = (process.argv[3] || "http://127.0.0.1:9222").replace(/\/$/, "");
-const PASSWORD = process.argv[4] || "admin12345";
+const KEY = process.argv[4] || "admin12345";
 const SHOT_DIR = process.argv[5] || "";
 
 // A token-shaped string for the add-account flow check.
@@ -34,7 +34,6 @@ const SYNTHETIC_TOKEN =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" +
   ".eyJ1c2VyX2lkIjoiOTAwNzE5OTI1NDc0MDk5MyIsImV4cCI6MTc5MzIwNTMyOH0" +
   ".c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU";
-const USERNAME = "admin";
 const TOKEN_KEY = "minimax2api:admin-token";
 
 // Every `t("…")` key the console uses, harvested from the sources.
@@ -275,15 +274,39 @@ async function checkPage(session, label, route, opts = {}) {
   }
 }
 
-// Click the first visible control whose label contains `text`.
-const CLICK = (text) => `(() => {
-  const wanted = ${JSON.stringify(text)};
-  const nodes = [...document.querySelectorAll("button,[role=menuitem],[role=option],a")];
-  const hit = nodes.find((n) => (n.innerText || "").includes(wanted) && n.offsetParent !== null);
-  if (!hit) return "not-found";
-  hit.click();
+// Click the first visible control whose label contains `text` — with the mouse.
+//
+// Deliberately not `element.click()`. A synthetic click fires one lone `click`
+// event with no mousedown, so a menu that unmounts itself on mousedown still
+// passes: the item is present when the click is dispatched. Real input goes
+// through the browser's hit-testing and the mousedown/mouseup pair, which is
+// exactly the gap between "the handler is wired" and "an operator can press it".
+// The dropdown menu lived in that gap: every item closed the menu on mousedown
+// and the click was then delivered to whatever sat underneath.
+async function clickLabel(session, text, settle = 700) {
+  const pos = await evaluate(
+    session,
+    `(() => {
+      const wanted = ${JSON.stringify(text)};
+      const nodes = [...document.querySelectorAll("button,[role=menuitem],[role=option],a")];
+      const hit = nodes.find((n) => (n.innerText || "").includes(wanted) && n.offsetParent !== null);
+      if (!hit) return null;
+      const r = hit.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    })()`,
+  ).catch(() => null);
+  if (!pos) return "not-found";
+  await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: pos.x, y: pos.y, buttons: 0 });
+  await session.send("Input.dispatchMouseEvent", {
+    type: "mousePressed", x: pos.x, y: pos.y, button: "left", clickCount: 1, buttons: 1,
+  });
+  await sleep(60);
+  await session.send("Input.dispatchMouseEvent", {
+    type: "mouseReleased", x: pos.x, y: pos.y, button: "left", clickCount: 1, buttons: 0,
+  });
+  await sleep(settle);
   return "clicked";
-})()`;
+}
 
 // checkAddAccountFlow exercises one console flow end to end, because a route
 // that renders is not a flow that works.
@@ -314,10 +337,8 @@ async function checkAddAccountFlow(session, adminToken) {
   ).catch(() => ({ total: -1, ids: [] }));
 
   await navigate(session, BASE + "/accounts");
-  await evaluate(session, CLICK("添加账号") + `; "ok"`).catch(() => {});
-  await sleep(700);
-  await evaluate(session, CLICK("Token 登录") + `; "ok"`).catch(() => {});
-  await sleep(900);
+  await clickLabel(session, "添加账号");
+  await clickLabel(session, "Token 登录", 900);
 
   const opened = await evaluate(session, `!!document.querySelector("[role=dialog]")`);
   if (!opened) {
@@ -340,8 +361,7 @@ async function checkAddAccountFlow(session, adminToken) {
   ).catch(() => {});
   await sleep(400);
 
-  await evaluate(session, CLICK("保存") + `; "ok"`).catch(() => {});
-  await sleep(2500);
+  await clickLabel(session, "保存", 2500);
 
   const after = await evaluate(
     session,
@@ -385,6 +405,85 @@ async function checkAddAccountFlow(session, adminToken) {
     ).catch(() => {});
   }
   if (created.length) console.log(`  [ok]   test account removed (${created.length})`);
+}
+
+// checkCaptureFlow drives the browser-capture dialog with real mouse input.
+//
+// It stops short of a delivery: the capture needs a helper on the operator's
+// machine, and there is none in a check environment. What it does cover is the
+// part that can be wrong without anything looking broken — that the item opens
+// its dialog, that starting a capture puts the dialog into a state the operator
+// can recognise, and that the force-cancel button is there and actually ends
+// the session. That last one is the promise the button makes: without it a
+// capture whose helper never came online would sit until the server timeout.
+async function checkCaptureFlow(session) {
+  const dialogText = () =>
+    evaluate(session, `(document.querySelector("[role=dialog]")?.innerText || "").replace(/\\s+/g, " ")`);
+
+  const cleanup = async () => {
+    // Best effort, and idempotent: the session expires on its own anyway.
+    await evaluate(
+      session,
+      `(async () => {
+        const res = await fetch("/admin/api/capture", {
+          headers: { authorization: "Bearer " + localStorage.getItem(${JSON.stringify(TOKEN_KEY)}) },
+        });
+        const data = await res.json();
+        const id = data?.capture?.id;
+        if (id && data.capture.state === "waiting") {
+          await fetch("/admin/api/capture/" + id + "/cancel", {
+            method: "POST",
+            headers: { authorization: "Bearer " + localStorage.getItem(${JSON.stringify(TOKEN_KEY)}) },
+          });
+        }
+        return "ok";
+      })()`,
+    ).catch(() => {});
+  };
+
+  await navigate(session, BASE + "/accounts");
+  await clickLabel(session, "添加账号");
+  await clickLabel(session, "浏览器抓取", 900);
+
+  const opened = await dialogText();
+  if (!opened.includes("浏览器抓取")) {
+    problems.push("capture dialog did not open");
+    console.log("  [FAIL] capture dialog never opened");
+    return;
+  }
+  console.log("  [ok]   the capture dialog opened");
+
+  await clickLabel(session, "开始抓取", 1500);
+  const started = await dialogText();
+  if (!started.includes("等待登录")) {
+    problems.push("starting a capture did not put the dialog into the waiting state");
+    console.log(`  [FAIL] no waiting state (saw "${started.slice(0, 80)}")`);
+    await cleanup();
+    return;
+  }
+  console.log("  [ok]   the dialog reports waiting for the sign-in");
+
+  if (!started.includes("强行取消")) {
+    problems.push("the force-cancel button is missing while capturing");
+    console.log("  [FAIL] no force-cancel button while capturing");
+    await cleanup();
+    return;
+  }
+
+  await clickLabel(session, "强行取消", 1800);
+  const cancelled = await dialogText();
+  if (!cancelled.includes("已取消")) {
+    problems.push("force-cancel did not end the capture");
+    console.log(`  [FAIL] still capturing after force-cancel (saw "${cancelled.slice(0, 80)}")`);
+    await cleanup();
+    return;
+  }
+  console.log("  [ok]   force-cancel ended the capture");
+
+  // The dialog must be closable again; a capture that ends is not a trap.
+  await evaluate(session, `document.querySelector("[role=dialog] button[aria-label], [role=dialog] button")?.click(); "ok"`);
+  await sleep(400);
+  await cleanup();
 }
 
 async function main() {
@@ -451,7 +550,7 @@ async function main() {
       const res = await fetch("/admin/api/auth/login", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ username: ${JSON.stringify(USERNAME)}, password: ${JSON.stringify(PASSWORD)} }),
+        body: JSON.stringify({ key: ${JSON.stringify(KEY)} }),
       });
       const data = await res.json();
       return data.token || "";
@@ -486,6 +585,9 @@ async function main() {
 
   console.log("\nconsole flow: add an account from a token alone");
   await checkAddAccountFlow(session, token);
+
+  console.log("\nconsole flow: capture a credential from a browser");
+  await checkCaptureFlow(session);
 
   await session.send("Page.captureScreenshot", { format: "png" }).catch(() => {});
   session.close();

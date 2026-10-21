@@ -7,7 +7,7 @@ console makes and fails only on 404/405, since any other status means the route
 was matched (400 = validation, 401 = auth, 200 = ok).
 
 Usage:
-    python tools/contract.py [--base http://127.0.0.1:18080] [--password admin12345]
+    python tools/contract.py [--base http://127.0.0.1:18080] [--key admin12345]
 """
 
 import argparse
@@ -40,7 +40,15 @@ def call(base, path, method="GET", body=None, token=None, timeout=30):
     try:
         with opener.open(request, timeout=timeout) as response:
             raw = response.read().decode()
-            return response.status, (json.loads(raw) if raw else {})
+            if not raw:
+                return response.status, {}
+            try:
+                return response.status, json.loads(raw)
+            except json.JSONDecodeError:
+                # A 200 that is not JSON is the SPA shell, which the app serves
+                # for any unknown GET. It must not be mistaken for a hit, and it
+                # must not be mistaken for a connection failure either.
+                return response.status, {"raw": raw[:200]}
     except urllib.error.HTTPError as error:
         raw = error.read().decode()
         try:
@@ -59,6 +67,13 @@ def probe(base, label, path, method, body, token, timeout=30):
     elif status == 0:
         PROBLEMS.append(f"{method} {path} (unreachable)")
         print(f"  [UNREACHABLE] {label:<30} {method:<6} {path}  {payload}")
+    elif isinstance(payload, dict) and "raw" in payload:
+        # The app's catch-all serves index.html for any unknown GET, so a route
+        # that was never implemented answers 200 with the SPA shell. Checking
+        # only the status code would call that a hit — the one shape of missing
+        # route this script exists to catch.
+        PROBLEMS.append(f"{method} {path} (answered with HTML, not JSON)")
+        print(f"  [MISSING] {label:<34} {method:<6} {path}  -> {status} (SPA shell, not JSON)")
     else:
         print(f"  [ok] {label:<39} {method:<6} {path}  -> {status}")
     return status, payload
@@ -67,8 +82,7 @@ def probe(base, label, path, method, body, token, timeout=30):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:8080")
-    parser.add_argument("--username", default="admin")
-    parser.add_argument("--password", default="admin12345")
+    parser.add_argument("--key", default="admin12345")
     args = parser.parse_args()
     base = args.base.rstrip("/")
 
@@ -77,7 +91,7 @@ def main():
 
     print("auth")
     status, payload = call(base, "/admin/api/auth/login", "POST",
-                           {"username": args.username, "password": args.password})
+                           {"key": args.key})
     token = payload.get("token", "")
     if not token:
         print(f"  login failed ({status}) - cannot continue: {payload}")
@@ -171,6 +185,23 @@ def main():
     probe(base, "account cleanup", "/admin/api/accounts/cleanup", "POST",
           {"statuses": ["invalid"]}, token)
 
+    print("\ncredential capture")
+    _, started = probe(base, "capture start", "/admin/api/capture", "POST",
+                       {"region": "global"}, token)
+    capture_id = (started.get("capture") or {}).get("id", "")
+    probe(base, "capture state", "/admin/api/capture", "GET", None, token)
+    probe(base, "capture helper poll", "/admin/api/capture/pending", "GET", None, token)
+    if capture_id:
+        # An empty token is rejected on purpose: the point is that the route
+        # resolves, and a probe that delivered a real credential would leave an
+        # account behind in the pool.
+        probe(base, "capture credential", f"/admin/api/capture/{capture_id}/credential", "POST",
+              {"token": ""}, token)
+        probe(base, "capture cancel", f"/admin/api/capture/{capture_id}/cancel", "POST", None, token)
+    else:
+        PROBLEMS.append("POST /admin/api/capture returned no session id")
+        print("  [MISSING] capture follow-ups              -      /admin/api/capture/{id}/…")
+
     print("\naudits & gallery")
     probe(base, "audit list", "/admin/api/audits", "GET", None, token)
     status, payload = call(base, "/admin/api/audits?limit=5", token=token)
@@ -203,9 +234,9 @@ def main():
     if key_id:
         probe(base, "key delete", f"/admin/api/client-keys/{key_id}", "DELETE", None, token)
 
-    print("\npassword endpoint (wrong current password, expects 400 not 404)")
-    probe(base, "password change", "/admin/api/auth/password", "POST",
-          {"currentPassword": "definitely-wrong", "newPassword": "whatever12345"}, token)
+    print("\nkey endpoint (wrong current key, expects 400 not 404)")
+    probe(base, "key change", "/admin/api/auth/key", "POST",
+          {"currentKey": "definitely-wrong", "newKey": "whatever12345"}, token)
 
     print("\nlogout")
     probe(base, "logout", "/admin/api/auth/logout", "POST", None, token)

@@ -9,7 +9,7 @@ frontend api layer, pulls a live response from each endpoint, and fails if the
 response is missing any field the frontend expects.
 
 Usage:
-    python tools/fields.py [--base http://127.0.0.1:18080] [--password admin12345]
+    python tools/fields.py [--base http://127.0.0.1:18080] [--key admin12345]
 """
 
 import argparse
@@ -39,6 +39,7 @@ CHECKS = [
     ("accounts", "AccountCredit", "/admin/api/accounts", "items.0.credit"),
     ("accounts", "SigninOverview", "/admin/api/signin", ""),
     ("accounts", "SigninReport", "/admin/api/signin", "lastReport"),
+    ("accounts", "CaptureSession", "/admin/api/capture", "capture"),
     ("client-keys", "ClientKeyDTO", "/admin/api/client-keys", "items.0"),
     ("models", "ModelDTO", "/admin/api/models", "items.0"),
     ("request-audits", "AuditDTO", "/admin/api/audits", "items.0"),
@@ -245,8 +246,7 @@ def self_check():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:8080")
-    parser.add_argument("--username", default="admin")
-    parser.add_argument("--password", default="admin12345")
+    parser.add_argument("--key", default="admin12345")
     parser.add_argument("--src", default="frontend/src")
     args = parser.parse_args()
     base = args.base.rstrip("/")
@@ -270,7 +270,7 @@ def main():
     print(f"parsed {len(types)} DTO type(s): {', '.join(sorted(types))}\n")
 
     status, payload = call(base, "/admin/api/auth/login", "POST",
-                           {"username": args.username, "password": args.password})
+                           {"key": args.key})
     token = payload.get("token", "")
     if not token:
         print(f"login failed ({status}) - cannot continue: {payload}")

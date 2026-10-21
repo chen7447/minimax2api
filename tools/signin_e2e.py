@@ -17,11 +17,11 @@ What it proves that the unit tests cannot:
   * the console's DTOs carry the new fields.
 
 Usage:
-    python tools/signin_e2e.py --base http://127.0.0.1:8080 --password admin12345
+    python tools/signin_e2e.py --base http://127.0.0.1:8080 --key admin12345
 
     # also cross-check the digests against the reverse-engineering workspace's
     # independently validated Python signer:
-    python tools/signin_e2e.py --password admin12345 \\
+    python tools/signin_e2e.py --key admin12345 \\
         --recon "C:/path/to/逆向minimax国际签到接口/code"
 
 The tool creates its own accounts and deletes them again. Run it against a
@@ -236,10 +236,9 @@ class MockUpstream:
 
 
 class Console:
-    def __init__(self, base, password, user="admin"):
+    def __init__(self, base, key):
         self.base = base.rstrip("/")
-        self.password = password
-        self.user = user
+        self.key = key
         self.token = ""
 
     def call(self, method, path, body=None, auth=True, timeout=60):
@@ -266,7 +265,7 @@ class Console:
 
     def login(self):
         status, payload = self.call("POST", "/admin/api/auth/login",
-                                    {"username": self.user, "password": self.password},
+                                    {"key": self.key},
                                     auth=False)
         self.token = payload.get("token", "")
         return status, self.token
@@ -356,15 +355,14 @@ def crosscheck_signatures(console, mock, recon_path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base", default="http://127.0.0.1:8080")
-    parser.add_argument("--password", required=True)
-    parser.add_argument("--user", default="admin")
+    parser.add_argument("--key", required=True)
     parser.add_argument("--mock-port", type=int, default=18098)
     parser.add_argument("--recon", default="",
                         help="path to the recon workspace's code/ directory; "
                              "enables the cross-implementation digest check")
     args = parser.parse_args()
 
-    console = Console(args.base, args.password, args.user)
+    console = Console(args.base, args.key)
     mock = MockUpstream(args.mock_port)
     mock.start()
     mock_url = f"http://127.0.0.1:{args.mock_port}"
