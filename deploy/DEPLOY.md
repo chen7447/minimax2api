@@ -13,7 +13,7 @@ minimax2api.service    systemd 单元
 DEPLOY.md              本手册
 ```
 
-> 依赖：Go 1.24+（本机在 `C:\Program Files\Go\bin`）、Node 20+（仅构建前端用）。VPS 本身**零依赖**：纯 Go 标准库静态编译，无 docker、无数据库。
+> 依赖：Go 1.27.3+（本机在 `C:\Program Files\Go\bin`；`go.mod` 的 `toolchain` 行会强制拉取该版本）、Node 20+（仅构建前端用）。VPS 本身**零依赖**：纯 Go 标准库静态编译，无 docker、无数据库。
 
 ## 1. 上传与安装（VPS，root）
 

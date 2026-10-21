@@ -6,6 +6,7 @@
 *.tsbuildinfo
 
 # Ad-hoc cross-builds kept beside the sources (gongyi/hardening experiments)
+/backend/minimax2api
 /backend/minimax2api_linux_*
 /backend/*.exe
 /dist-*.tgz
