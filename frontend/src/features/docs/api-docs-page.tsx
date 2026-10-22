@@ -93,17 +93,18 @@ data: [DONE]`,
     "response_format": "url"
   }'`,
     response: `{
-  "created": 1758000000,
+  "created": 1792667805,
+  "status": "succeeded",
   "data": [
     {
-      "url": "/media/media_07b50cd7.png",
-      "source_url": "https://p16-flow-image-sign.ibyteimg.com/..."
+      "url": "/media/media_10acc8ff.png",
+      "source_url": "https://matrix-internal.oss-us-east-1.aliyuncs.com/..."
     }
   ]
 }
 
-// 这一轮没有产出时（Agent 没有调用图像工具）
-{ "created": 1758000000, "data": [] }`,
+// 没出图时：Agent 的原话在 detail 里
+{ "created": 1792667805, "status": "pending", "detail": "……", "data": [] }`,
     parameters: [
       { name: "prompt", type: "string", required: true, noteKey: "docs.notePrompt" },
       { name: "response_format", type: "string", noteKey: "docs.noteResponseFormat" },

@@ -622,10 +622,10 @@ const zhCN = {
       "OpenAI 兼容的对话接口，支持流式输出、视觉输入与推理内容。图像模型也从这里进：客户端只拿得到模型 id，看不出它是不是图像模型，所以生成的图片会以 Markdown 图片形式回在正文里。",
     imageGenerations: "图像生成",
     imageDescription:
-      "图像生成。上游是 Agent 轮次里的一次工具调用，返回几张由 Agent 决定，不是固定值；这一轮没有产出时 data 为空数组。url 是网关的相对路径，前面拼上基础地址即可，下载失败时回上游 CDN 的绝对地址。",
+      "图像生成。上游是 Agent 轮次里的一次工具调用：Agent 把图写进账号的 workspace，网关再去该账号的 drive 取本轮产物并落盘，所以 url 是网关自己的副本（相对路径，前面拼基础地址）。这一轮没出图时 status=pending，Agent 的原话在 detail 里。",
     videoGenerations: "视频生成",
     videoDescription:
-      "同步的视频生成接口。快变体 minimax-h3-max 实测 1–5 分钟出片；H3.0 官方标注 15–30 分钟，超过同步接口能等的 10 分钟，因此只返回 status=pending 和 Agent 的原话。url 同样是网关的相对路径。",
+      "同步的视频生成接口。h3-max 5 秒 768P 实测 137–297 秒出片；H3.0 官方标注 15–30 分钟，超过同步接口能等的 10 分钟，因此只返回 status=pending 和 Agent 的原话。url 同样是网关的相对路径。",
     health: "健康检查",
     healthDescription: "返回服务状态与号池概况。",
     stream: "流式",
@@ -642,7 +642,7 @@ const zhCN = {
       "常见返回：401 密钥不对；400 unknown model 模型没进渠道；200 但 data 为空 表示这一轮 Agent 没产出（视频会带 detail 说明原因）；502 是上游 session 创建挂起，重试即可。",
     creditTitle: "额度怎么走",
     creditBody:
-      "图像/视频每次请求都是被路由到的那个账号的一次 Agent 轮次，扣的是该账号的上游积分（图像/视频积分，不占 Token Plan），单价由上游按模型、时长、分辨率决定，网关不预估也不记账。面板上的「积分」是上游读数，由后台轮询同步（全池 30 分钟一轮、公益池 5 分钟 2 个账号），所以消耗是「上游先扣、面板后显」。New API 侧的额度按它自己的计费规则另算，与上游无关。",
+      "图像/视频每次请求都是被路由到的那个账号的一次 Agent 轮次，扣的是该账号的上游积分（图像/视频积分，不占 Token Plan），单价由上游按模型、时长、分辨率决定，网关不预估也不记账。2026-10-22 实测（国际站账号）：图像一次约 120 积分，h3-max 5 秒 768P 一次约 290–310 积分。面板上的「积分」是上游读数，由后台轮询同步（全池 30 分钟一轮、公益池 5 分钟 2 个账号），所以消耗是「上游先扣、面板后显」；要精确对账就看某个账号刷积分前后的差值。New API 侧的额度按它自己的计费规则另算，与上游无关。",
     noteModel:
       "minimax-agent（默认）、minimax-m3.1-flash、minimax-m3.1-flash-preview（旧名）、minimax-m3、minimax-m3-thinking、minimax-m2.7、minimax-m2.7-highspeed，或 minimax-image —— 选图像模型时，图片以 Markdown 形式回在正文里；视频模型只能走 /v1/videos/generations",
     noteMessages: "OpenAI 标准消息数组，支持 text 与 image_url 多模态内容",
@@ -1293,10 +1293,10 @@ const en: typeof zhCN = {
       "OpenAI-compatible chat endpoint with streaming, vision input and reasoning content. Image models are reached here too: a client only sees the model id and cannot tell that it is an image model, so the generated pictures come back as Markdown in the message body.",
     imageGenerations: "Image generations",
     imageDescription:
-      "Image generation. Upstream this is a tool call inside an agent turn, so how many pictures come back is the agent's decision rather than a fixed number; a turn that produced nothing returns an empty data array. url is a path relative to this gateway — prefix the base URL — and falls back to the upstream CDN URL when the download failed.",
+      "Image generation. Upstream this is a tool call inside an agent turn: the agent writes the picture into the account's workspace and the gateway then fetches this turn's artifacts from that account's drive and stores them, so url points at the gateway's own copy (a path relative to this gateway — prefix the base URL). A turn that produced nothing returns status=pending with the agent's own words in detail.",
     videoGenerations: "Video generations",
     videoDescription:
-      "Synchronous video generation. The fast minimax-h3-max variant took 1–5 minutes in testing; H3.0 is documented at 15–30 minutes, beyond the 10-minute synchronous budget, so it returns status=pending with the agent's own words. url is likewise relative to this gateway.",
+      "Synchronous video generation. h3-max at 5s/768P took 137–297 seconds in testing; H3.0 is documented at 15–30 minutes, beyond the 10-minute synchronous budget, so it returns status=pending with the agent's own words. url is likewise relative to this gateway.",
     health: "Health check",
     healthDescription: "Returns service status and pool summary.",
     stream: "Streaming",
@@ -1313,7 +1313,7 @@ const en: typeof zhCN = {
       "Common answers: 401 wrong key; 400 unknown model means the model is not in the channel; 200 with empty data means the agent produced nothing this turn (video carries a detail field); 502 means the upstream session hung — just retry.",
     creditTitle: "How quota is consumed",
     creditBody:
-      "Every image/video request is one agent turn on the account it was routed to, paid from that account's upstream credits (image/video credits, not the token plan). The unit price is set upstream by model, duration and resolution; the gateway neither estimates nor books it. The credit figure in the console is an upstream reading refreshed by the background poller (whole pool every 30 minutes, public pool two accounts every 5 minutes), so consumption shows up after the next sync. New API's own quota is billed by its own rules and is unrelated.",
+      "Every image/video request is one agent turn on the account it was routed to, paid from that account's upstream credits (image/video credits, not the token plan). The unit price is set upstream by model, duration and resolution; the gateway neither estimates nor books it. Measured on 2026-10-22 (international accounts): about 120 credits per image, about 290–310 credits per 5s/768P h3-max video. The credit figure in the console is an upstream reading refreshed by the background poller (whole pool every 30 minutes, public pool two accounts every 5 minutes), so consumption shows up after the next sync — for an exact number, compare one account's credit before and after a refresh. New API's own quota is billed by its own rules and is unrelated.",
     noteModel:
       "minimax-agent (default), minimax-m3.1-flash, minimax-m3.1-flash-preview (old name), minimax-m3, minimax-m3-thinking, minimax-m2.7, minimax-m2.7-highspeed, or minimax-image — with an image model the pictures come back as Markdown in the message body; video models are only reachable through /v1/videos/generations",
     noteMessages: "Standard OpenAI message array; text and image_url multimodal content are both supported",
