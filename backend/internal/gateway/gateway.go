@@ -814,6 +814,22 @@ func (g *Gateway) imageModel() (*store.ModelConfig, error) {
 	return model, nil
 }
 
+// imageAttemptTimeout bounds one image turn, and imageTurnBudget bounds all of
+// them together.
+//
+// A successful image turn takes about a minute (two live turns: 60.5s, 64.9s),
+// but the upstream occasionally accepts the session request and then says
+// nothing at all. That hang used to consume the full 300s request budget on the
+// first account, so the retry loop never ran and the caller got a 502 from an
+// otherwise healthy pool — a live turn showed exactly that. Capping each
+// attempt at 120s turns a dead account into one lost attempt instead of one
+// lost request; the pool puts it in cooldown on the error, so the next attempt
+// lands on a different account. The outer budget keeps the total unchanged.
+const (
+	imageAttemptTimeout = 120 * time.Second
+	imageTurnBudget     = 300 * time.Second
+)
+
 // runImageTurn sends one image request through the pool and reports what came
 // back. It does no authentication, no limiting and no auditing, because it is
 // called from two endpoints whose request shapes have nothing in common and
@@ -824,6 +840,13 @@ func (g *Gateway) runImageTurn(
 	images []minimax.UploadedImage,
 ) (*minimax.Result, string, minimax.Credential, error) {
 	settings := g.settings()
+	budget := imageTurnBudget
+	if configured := settings.RequestTimeout(); configured > 0 && configured < budget {
+		budget = configured
+	}
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
 	var (
 		lastErr     error
 		accountName string
@@ -845,7 +868,7 @@ func (g *Gateway) runImageTurn(
 			Text:        prompt,
 			Mode:        "image",
 			Images:      images,
-			Timeout:     settings.RequestTimeout(),
+			Timeout:     imageAttemptTimeout,
 			IdleTimeout: settings.StreamIdleTimeout(),
 		})
 		lease.Release(err)

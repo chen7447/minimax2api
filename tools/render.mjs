@@ -103,7 +103,7 @@ const ROUTES = [
   ["/accounts", "号池管理"],
   ["/client-keys", "客户端密钥"],
   ["/models", "模型"],
-  ["/gallery", "生成画廊"],
+  ["/gallery", "媒体库"],
   ["/request-audits", "请求审计"],
   ["/docs/chat/completions", "接口文档", "messages"],
   // The docs page is one component parameterised by the route, so a route that
