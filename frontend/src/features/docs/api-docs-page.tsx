@@ -71,7 +71,9 @@ data: [DONE]`,
     { "id": "minimax-m2.7", "object": "model", "owned_by": "minimax" },
     { "id": "minimax-m2.7-highspeed", "object": "model", "owned_by": "minimax" },
     { "id": "minimax-image", "object": "model", "owned_by": "minimax" },
-    { "id": "minimax-h3-max", "object": "model", "owned_by": "minimax" }
+    { "id": "minimax-h3", "object": "model", "owned_by": "minimax" },
+    { "id": "minimax-h3-max", "object": "model", "owned_by": "minimax" },
+    { "id": "minimax-hailuo-2-3", "object": "model", "owned_by": "minimax" }
   ]
 }`,
     parameters: [],
@@ -88,19 +90,72 @@ data: [DONE]`,
   -H "Content-Type: application/json" \\
   -d '{
     "prompt": "一只在花园里散步的猫，写实风格",
-    "n": 4
+    "response_format": "url"
   }'`,
     response: `{
   "created": 1758000000,
   "data": [
-    { "url": "http://127.0.0.1:8080/media/gen_xxx_0.png", "source_url": "https://p16-flow-image-sign.ibyteimg.com/..." }
+    {
+      "url": "/media/media_07b50cd7.png",
+      "source_url": "https://p16-flow-image-sign.ibyteimg.com/..."
+    }
   ]
-}`,
+}
+
+// 这一轮没有产出时（Agent 没有调用图像工具）
+{ "created": 1758000000, "data": [] }`,
     parameters: [
       { name: "prompt", type: "string", required: true, noteKey: "docs.notePrompt" },
+      { name: "response_format", type: "string", noteKey: "docs.noteResponseFormat" },
       { name: "n", type: "number", noteKey: "docs.noteN" },
       { name: "size", type: "string", noteKey: "docs.noteSize" },
-      { name: "response_format", type: "string", noteKey: "docs.noteResponseFormat" },
+    ],
+  },
+  {
+    category: "video",
+    endpoint: "generations",
+    method: "POST",
+    path: "/v1/videos/generations",
+    titleKey: "docs.videoGenerations",
+    descriptionKey: "docs.videoDescription",
+    request: `curl http://127.0.0.1:8080/v1/videos/generations \\
+  -H "Authorization: Bearer sk-mm-xxxx" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "minimax-h3-max",
+    "prompt": "a paper boat drifting on a calm pond, gentle ripples",
+    "duration": 5,
+    "ratio": "16:9",
+    "resolution": "768P"
+  }'`,
+    response: `{
+  "created": 1792666573,
+  "model": "minimax-h3-max",
+  "status": "succeeded",
+  "data": [
+    {
+      "url": "/media/media_07b50cd7.mp4",
+      "source_url": "https://matrix-internal.oss-us-east-1.aliyuncs.com/..."
+    }
+  ]
+}
+
+// 超时前还没出片（H3.0 的常态）：任务已提交，detail 是 Agent 的原话
+{
+  "created": 1792666573,
+  "model": "minimax-h3",
+  "status": "pending",
+  "detail": "……",
+  "data": []
+}`,
+    parameters: [
+      { name: "prompt", type: "string", required: true, noteKey: "docs.noteVideoPrompt" },
+      { name: "model", type: "string", noteKey: "docs.noteVideoModel" },
+      { name: "duration", type: "number", noteKey: "docs.noteDuration" },
+      { name: "ratio", type: "string", noteKey: "docs.noteRatio" },
+      { name: "resolution", type: "string", noteKey: "docs.noteResolution" },
+      { name: "image_url", type: "string", noteKey: "docs.noteImageURL" },
+      { name: "image_urls", type: "array", noteKey: "docs.noteImageURLs" },
     ],
   },
   {
@@ -153,6 +208,19 @@ export function ApiDocsPage() {
           </div>
         </dl>
         <p className="mt-3 text-[11px] leading-5 text-muted-foreground">{t("docs.authHelp")}</p>
+      </section>
+
+      <section className="rounded-lg bg-card p-4">
+        <h2 className="text-xs font-medium">{t("docs.integration")}</h2>
+        <ul className="mt-3 space-y-2 text-[11px] leading-5 text-muted-foreground">
+          <li>{t("docs.integrationDirect")}</li>
+          <li>{t("docs.integrationNewApi")}</li>
+          <li>{t("docs.integrationModels")}</li>
+          <li>{t("docs.integrationVideo")}</li>
+          <li>{t("docs.integrationErrors")}</li>
+        </ul>
+        <h2 className="mt-4 text-xs font-medium">{t("docs.creditTitle")}</h2>
+        <p className="mt-2 text-[11px] leading-5 text-muted-foreground">{t("docs.creditBody")}</p>
       </section>
 
       <section className="rounded-lg bg-card p-4">

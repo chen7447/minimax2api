@@ -111,6 +111,7 @@ const ROUTES = [
   // third element is the tell: text that only this endpoint's page contains.
   // Without it a typo'd URL passes by quietly showing somebody else's table.
   ["/docs/image/generations", "接口文档", "response_format"],
+  ["/docs/video/generations", "接口文档", "minimax-h3-max"],
   ["/settings", "运行时设置"],
 ];
 

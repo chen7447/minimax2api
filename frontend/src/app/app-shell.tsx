@@ -1,4 +1,4 @@
-import { ChevronDown, Eye, Heart, Image, KeyRound, LayoutDashboard, LogOut, Menu, Monitor, Moon, MoreHorizontal, Settings, Sparkles, Sun, Users, Languages, Box, Activity, Coins } from "lucide-react";
+import { ChevronDown, Eye, Heart, Image, KeyRound, LayoutDashboard, LogOut, Menu, Monitor, Moon, MoreHorizontal, Settings, Sparkles, Sun, Users, Languages, Box, Activity, Coins, Video } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
@@ -38,6 +38,11 @@ const documentation = [
     label: "Image",
     icon: Image,
     items: [{ href: "/docs/image/generations", label: "Image Generations", method: "POST" }],
+  },
+  {
+    label: "Video",
+    icon: Video,
+    items: [{ href: "/docs/video/generations", label: "Video Generations", method: "POST" }],
   },
   {
     label: "System",

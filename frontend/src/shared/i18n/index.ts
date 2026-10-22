@@ -621,20 +621,46 @@ const zhCN = {
     chatDescription:
       "OpenAI 兼容的对话接口，支持流式输出、视觉输入与推理内容。图像模型也从这里进：客户端只拿得到模型 id，看不出它是不是图像模型，所以生成的图片会以 Markdown 图片形式回在正文里。",
     imageGenerations: "图像生成",
-    imageDescription: "图像生成。上游是 Agent 轮次里的一次工具调用，返回几张由 Agent 决定，不是固定值。",
+    imageDescription:
+      "图像生成。上游是 Agent 轮次里的一次工具调用，返回几张由 Agent 决定，不是固定值；这一轮没有产出时 data 为空数组。url 是网关的相对路径，前面拼上基础地址即可，下载失败时回上游 CDN 的绝对地址。",
+    videoGenerations: "视频生成",
+    videoDescription:
+      "同步的视频生成接口。快变体 minimax-h3-max 实测 1–5 分钟出片；H3.0 官方标注 15–30 分钟，超过同步接口能等的 10 分钟，因此只返回 status=pending 和 Agent 的原话。url 同样是网关的相对路径。",
     health: "健康检查",
     healthDescription: "返回服务状态与号池概况。",
     stream: "流式",
+    integration: "接入方式",
+    integrationDirect:
+      "直连网关：基础地址用上面的地址，请求头带 Authorization: Bearer sk-mm-…。图像走 POST /v1/images/generations，视频走 POST /v1/videos/generations。",
+    integrationNewApi:
+      "经 New API：新建渠道，类型选 OpenAI 兼容，Base URL 填上面的基础地址（不要带 /v1，New API 会自己拼），密钥填 sk-mm-…；客户端调 New API 时用它自己签发的 key。",
+    integrationModels:
+      "渠道的模型列表必须逐个登记模型 id：minimax-m3、minimax-m3-thinking、minimax-m3.1-flash、minimax-m2.7、minimax-m2.7-highspeed、minimax-agent、minimax-image、minimax-h3-max、minimax-h3、minimax-hailuo-2-3。填上游名（MiniMax-H3-Max）或没登记的 id 会 400 unknown model。",
+    integrationVideo:
+      "New API 是否转发 /v1/videos/generations 取决于它的版本；不支持时视频用 sk-mm-… 直连网关 —— New API 的 key 只对 New API 自己的路由有效，拿它打网关一定是 401。",
+    integrationErrors:
+      "常见返回：401 密钥不对；400 unknown model 模型没进渠道；200 但 data 为空 表示这一轮 Agent 没产出（视频会带 detail 说明原因）；502 是上游 session 创建挂起，重试即可。",
+    creditTitle: "额度怎么走",
+    creditBody:
+      "图像/视频每次请求都是被路由到的那个账号的一次 Agent 轮次，扣的是该账号的上游积分（图像/视频积分，不占 Token Plan），单价由上游按模型、时长、分辨率决定，网关不预估也不记账。面板上的「积分」是上游读数，由后台轮询同步（全池 30 分钟一轮、公益池 5 分钟 2 个账号），所以消耗是「上游先扣、面板后显」。New API 侧的额度按它自己的计费规则另算，与上游无关。",
     noteModel:
-      "minimax-agent（默认）、minimax-m3.1-flash、minimax-m3.1-flash-preview（旧名）、minimax-m3、minimax-m3-thinking、minimax-m2.7、minimax-m2.7-highspeed，或 minimax-image —— 选图像模型时，图片以 Markdown 形式回在正文里",
+      "minimax-agent（默认）、minimax-m3.1-flash、minimax-m3.1-flash-preview（旧名）、minimax-m3、minimax-m3-thinking、minimax-m2.7、minimax-m2.7-highspeed，或 minimax-image —— 选图像模型时，图片以 Markdown 形式回在正文里；视频模型只能走 /v1/videos/generations",
     noteMessages: "OpenAI 标准消息数组，支持 text 与 image_url 多模态内容",
     noteStream: "是否使用 SSE 流式输出，默认 false",
     notePassthrough: "透传字段，上游不区分，仅用于兼容客户端",
     noteMaxTokens: "透传字段，上游不限制输出长度",
     notePrompt: "图像描述",
-    noteN: "期望数量。实际返回几张由 Agent 决定，不保证等于这个值，也不保证一定有图片",
-    noteSize: "透传字段，上游由模型决定",
+    noteN: "会被忽略：返回几张由 Agent 决定，不保证一定有图片",
+    noteSize: "会被忽略：尺寸由上游模型决定",
     noteResponseFormat: "url（默认）或 b64_json",
+    noteVideoPrompt: "视频描述，直接作为 Agent 的指令",
+    noteVideoModel:
+      "minimax-h3-max（默认，快变体）、minimax-h3（H3.0，质量优先）、minimax-hailuo-2-3（成本更低，无声）",
+    noteDuration: "整秒，5–15；不传用控制台默认值",
+    noteRatio: "画幅，如 16:9、9:16；不传用默认 16:9",
+    noteResolution: "480P / 768P；不传用默认 768P",
+    noteImageURL: "首帧图片 URL（图生视频）",
+    noteImageURLs: "多张参考图的 URL 数组",
   },
   errors: {
     generic: "操作失败，请稍后重试",
@@ -1267,21 +1293,45 @@ const en: typeof zhCN = {
       "OpenAI-compatible chat endpoint with streaming, vision input and reasoning content. Image models are reached here too: a client only sees the model id and cannot tell that it is an image model, so the generated pictures come back as Markdown in the message body.",
     imageGenerations: "Image generations",
     imageDescription:
-      "Image generation. Upstream this is a tool call inside an agent turn, so how many pictures come back is the agent's decision rather than a fixed number.",
+      "Image generation. Upstream this is a tool call inside an agent turn, so how many pictures come back is the agent's decision rather than a fixed number; a turn that produced nothing returns an empty data array. url is a path relative to this gateway — prefix the base URL — and falls back to the upstream CDN URL when the download failed.",
+    videoGenerations: "Video generations",
+    videoDescription:
+      "Synchronous video generation. The fast minimax-h3-max variant took 1–5 minutes in testing; H3.0 is documented at 15–30 minutes, beyond the 10-minute synchronous budget, so it returns status=pending with the agent's own words. url is likewise relative to this gateway.",
     health: "Health check",
     healthDescription: "Returns service status and pool summary.",
     stream: "Streaming",
+    integration: "How to connect",
+    integrationDirect:
+      "Direct: use the base URL above with Authorization: Bearer sk-mm-…. Images go to POST /v1/images/generations, videos to POST /v1/videos/generations.",
+    integrationNewApi:
+      "Through New API: create a channel of type OpenAI-compatible, set Base URL to the base address above (without /v1 — New API appends it), and use the sk-mm-… key. Clients then call New API with the key New API issued.",
+    integrationModels:
+      "Register each model id in the channel's model list: minimax-m3, minimax-m3-thinking, minimax-m3.1-flash, minimax-m2.7, minimax-m2.7-highspeed, minimax-agent, minimax-image, minimax-h3-max, minimax-h3, minimax-hailuo-2-3. An upstream name (MiniMax-H3-Max) or an unregistered id returns 400 unknown model.",
+    integrationVideo:
+      "Whether New API relays /v1/videos/generations depends on its version; when it does not, call the gateway directly with sk-mm-… — a New API key only works on New API's own routes and returns 401 here.",
+    integrationErrors:
+      "Common answers: 401 wrong key; 400 unknown model means the model is not in the channel; 200 with empty data means the agent produced nothing this turn (video carries a detail field); 502 means the upstream session hung — just retry.",
+    creditTitle: "How quota is consumed",
+    creditBody:
+      "Every image/video request is one agent turn on the account it was routed to, paid from that account's upstream credits (image/video credits, not the token plan). The unit price is set upstream by model, duration and resolution; the gateway neither estimates nor books it. The credit figure in the console is an upstream reading refreshed by the background poller (whole pool every 30 minutes, public pool two accounts every 5 minutes), so consumption shows up after the next sync. New API's own quota is billed by its own rules and is unrelated.",
     noteModel:
-      "minimax-agent (default), minimax-m3.1-flash, minimax-m3.1-flash-preview (old name), minimax-m3, minimax-m3-thinking, minimax-m2.7, minimax-m2.7-highspeed, or minimax-image — with an image model the pictures come back as Markdown in the message body",
+      "minimax-agent (default), minimax-m3.1-flash, minimax-m3.1-flash-preview (old name), minimax-m3, minimax-m3-thinking, minimax-m2.7, minimax-m2.7-highspeed, or minimax-image — with an image model the pictures come back as Markdown in the message body; video models are only reachable through /v1/videos/generations",
     noteMessages: "Standard OpenAI message array; text and image_url multimodal content are both supported",
     noteStream: "Use SSE streaming, default false",
     notePassthrough: "Passed through; the upstream does not distinguish it, and it exists for client compatibility",
     noteMaxTokens: "Passed through; the upstream does not cap output length",
     notePrompt: "What to draw",
-    noteN:
-      "How many are wanted. The agent decides what actually comes back, so this is not guaranteed — neither the count nor that anything comes back at all",
-    noteSize: "Passed through; the model decides",
+    noteN: "Ignored: the agent decides how many come back, and nothing is guaranteed",
+    noteSize: "Ignored: the size is decided by the upstream model",
     noteResponseFormat: "url (default) or b64_json",
+    noteVideoPrompt: "What to generate; sent to the agent as the instruction",
+    noteVideoModel:
+      "minimax-h3-max (default, fast variant), minimax-h3 (H3.0, quality first), minimax-hailuo-2-3 (cheaper, silent output)",
+    noteDuration: "Whole seconds, 5–15; falls back to the console default",
+    noteRatio: "Aspect ratio, e.g. 16:9 or 9:16; defaults to 16:9",
+    noteResolution: "480P or 768P; defaults to 768P",
+    noteImageURL: "First-frame image URL (image-to-video)",
+    noteImageURLs: "Array of reference image URLs",
   },
   errors: {
     generic: "Something went wrong, please retry",
