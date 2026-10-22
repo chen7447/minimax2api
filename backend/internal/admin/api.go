@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -128,6 +129,8 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /admin/api/settings", a.guard(a.saveSettings))
 
 	mux.HandleFunc("GET /admin/api/gallery", a.guard(a.gallery))
+	mux.HandleFunc("DELETE /admin/api/gallery/{id}", a.guard(a.deleteMedia))
+	mux.HandleFunc("POST /admin/api/gallery/delete", a.guard(a.deleteMediaBatch))
 }
 
 // ---------------------------------------------------------------- middleware
@@ -2118,6 +2121,69 @@ func (a *API) saveSettings(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) gallery(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": a.store.ListMedia()})
+}
+
+// deleteMedia removes one gallery entry and the copy this gateway downloaded.
+func (a *API) deleteMedia(w http.ResponseWriter, r *http.Request) {
+	a.removeMedia(w, []string{r.PathValue("id")})
+}
+
+// deleteMediaBatch is the console's "delete selected" path. It is a POST with a
+// body rather than a DELETE with one, because proxies and clients disagree
+// about whether a DELETE may carry a body.
+func (a *API) deleteMediaBatch(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		IDs []string `json:"ids"`
+	}
+	if err := decode(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if len(request.IDs) == 0 {
+		writeError(w, http.StatusBadRequest, "ids is required")
+		return
+	}
+	a.removeMedia(w, request.IDs)
+}
+
+// removeMedia deletes the entries first and the files after: the list is the
+// only index of those files, so a failure to unlink must not leave an entry
+// pointing at something that is gone.
+//
+// Files are removed only for entries whose url is a local "/media/…" path. An
+// entry still holding the upstream CDN link has nothing of ours on disk.
+func (a *API) removeMedia(w http.ResponseWriter, ids []string) {
+	removed := a.store.DeleteMedia(ids)
+	settings := a.store.Settings()
+	for _, item := range removed {
+		path, ok := localMediaPath(settings, item.URL)
+		if !ok {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("删除媒体文件失败 %s: %v", path, err)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": len(removed)})
+}
+
+// localMediaPath maps a stored url to the file this gateway downloaded.
+//
+// Anything that is not exactly "/media/<name>" is refused, and the name is
+// reduced to its base before joining: the delete button must never be able to
+// name a path outside the generated-media directory, whatever a state file or a
+// crafted request says.
+func localMediaPath(settings config.Settings, url string) (string, bool) {
+	const prefix = "/media/"
+	if !strings.HasPrefix(url, prefix) {
+		return "", false
+	}
+	name := filepath.Base(strings.TrimPrefix(url, prefix))
+	if name == "" || name == "." || name == ".." || name == string(filepath.Separator) ||
+		strings.ContainsAny(name, `/\`) {
+		return "", false
+	}
+	return filepath.Join(settings.Media.GeneratedDir, name), true
 }
 
 // ------------------------------------------------------------------ helpers

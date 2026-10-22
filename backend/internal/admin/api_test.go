@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -385,5 +386,39 @@ func TestTheTwoFingerprintFieldsAreNotInterchangeable(t *testing.T) {
 	uuid := newUUID()
 	if _, err := strconv.Atoi(uuid); err == nil {
 		t.Errorf("the uuid %q parses as a number; the two fields have different shapes", uuid)
+	}
+}
+
+// The delete button names a path built from a stored url. A state file or a
+// crafted request must not be able to make it name anything outside the
+// generated-media directory — this is the only thing between "delete my video"
+// and "delete /etc/passwd".
+func TestLocalMediaPathStaysInsideTheGeneratedDir(t *testing.T) {
+	settings := config.DefaultSettings("data")
+	settings.Media.GeneratedDir = filepath.Join("data", "generated")
+
+	cases := []struct {
+		name string
+		url  string
+		ok   bool
+		want string
+	}{
+		{"downloaded copy", "/media/media_abc.png", true, filepath.Join("data", "generated", "media_abc.png")},
+		{"upstream link", "https://cdn.example.com/x.png", false, ""},
+		{"empty name", "/media/", false, ""},
+		{"dot dot", "/media/..", false, ""},
+		{"nested", "/media/sub/media_abc.png", true, filepath.Join("data", "generated", "media_abc.png")},
+		{"traversal", "/media/../../etc/passwd", true, filepath.Join("data", "generated", "passwd")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := localMediaPath(settings, tc.url)
+			if ok != tc.ok {
+				t.Fatalf("ok = %v, want %v (path %q)", ok, tc.ok, got)
+			}
+			if ok && got != tc.want {
+				t.Fatalf("path = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

@@ -536,3 +536,61 @@ func TestBuiltinModelsCoverTheUpstreamSelector(t *testing.T) {
 		t.Errorf("the catalogue has no entry for %q", id)
 	}
 }
+
+// Deleting media has to report exactly what it removed: the caller uses those
+// urls to unlink the files, and a silent success would leave disk behind. Ids
+// that are already gone are ignored, so a double click or two console tabs do
+// not turn into an error.
+func TestDeleteMediaReturnsTheRemovedEntries(t *testing.T) {
+	st := newTestStore(t)
+	st.AddMedia(&MediaItem{ID: "media_a", Kind: "image", URL: "/media/media_a.png"})
+	st.AddMedia(&MediaItem{ID: "media_b", Kind: "video", URL: "/media/media_b.mp4"})
+	st.AddMedia(&MediaItem{ID: "media_c", Kind: "image", URL: "/media/media_c.png"})
+
+	removed := st.DeleteMedia([]string{"media_a", "media_c", "media_missing"})
+	if len(removed) != 2 {
+		t.Fatalf("removed = %d, want 2", len(removed))
+	}
+	names := map[string]string{}
+	for _, item := range removed {
+		names[item.ID] = item.URL
+	}
+	if names["media_a"] != "/media/media_a.png" || names["media_c"] != "/media/media_c.png" {
+		t.Fatalf("removed = %v, want the two deleted urls", names)
+	}
+
+	remaining := st.ListMedia()
+	if len(remaining) != 1 || remaining[0].ID != "media_b" {
+		t.Fatalf("remaining = %v, want only media_b", remaining)
+	}
+
+	if again := st.DeleteMedia([]string{"media_a"}); len(again) != 0 {
+		t.Fatalf("deleting a missing id reported %d removals", len(again))
+	}
+}
+
+// The entry and its file are the same record from the operator's point of
+// view: an entry that only lives in memory becomes a broken thumbnail after a
+// restart, and the file it names becomes unreachable.
+//
+// The check deliberately does not close the store first: Close's final flush is
+// best-effort (it skips when the writer is mid-write), so a test that leaned on
+// it would pass or fail on timing. Waiting past the 40ms debounce and reading
+// the file the way a restart does is what proves AddMedia marked the state
+// dirty itself.
+func TestAddedMediaReachesDiskWithoutAnotherMutation(t *testing.T) {
+	st := newTestStore(t)
+	st.AddMedia(&MediaItem{ID: "media_x", Kind: "image", URL: "/media/media_x.png"})
+	time.Sleep(200 * time.Millisecond)
+
+	reopened, err := Open(st.DataDir(), "admin", "admin12345")
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	items := reopened.ListMedia()
+	if len(items) != 1 || items[0].ID != "media_x" {
+		t.Fatalf("media after reopen = %v, want media_x", items)
+	}
+}

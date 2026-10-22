@@ -989,11 +989,42 @@ func (s *Store) PurgeAudits() {
 
 func (s *Store) AddMedia(item *MediaItem) {
 	s.mu.Lock()
+	defer s.unlockAndNotify()
 	s.state.Media = append([]*MediaItem{item}, s.state.Media...)
 	if len(s.state.Media) > 500 {
 		s.state.Media = s.state.Media[:500]
 	}
-	s.mu.Unlock()
+	// Without this the entry only reaches disk when some other mutation happens
+	// to mark the state dirty — a gallery entry can outlive its request but not
+	// a restart, and the file it names becomes unreachable from the console.
+	s.markDirtyLocked()
+}
+
+// DeleteMedia removes the listed entries and returns what was actually removed,
+// so the caller can delete the files those entries name. Unknown ids are
+// ignored: deleting twice, or deleting from two tabs at once, must not fail.
+func (s *Store) DeleteMedia(ids []string) []*MediaItem {
+	wanted := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		wanted[id] = struct{}{}
+	}
+	s.mu.Lock()
+	defer s.unlockAndNotify()
+	kept := make([]*MediaItem, 0, len(s.state.Media))
+	removed := make([]*MediaItem, 0, len(ids))
+	for _, item := range s.state.Media {
+		if _, ok := wanted[item.ID]; ok {
+			removed = append(removed, item)
+			continue
+		}
+		kept = append(kept, item)
+	}
+	if len(removed) == 0 {
+		return nil
+	}
+	s.state.Media = kept
+	s.markDirtyLocked()
+	return removed
 }
 
 func (s *Store) ListMedia() []*MediaItem {
