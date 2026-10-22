@@ -1181,6 +1181,62 @@ func TestImageGenerationsReportsPendingWhenNothingIsProduced(t *testing.T) {
 	}
 }
 
+// The picture is not in the stream either: the agent writes it to the
+// workspace and announces it with a <media src="/workspace/…"> tag, which the
+// payload walker cannot see. The drive lookup is what turns that into a URL,
+// and without it a paid success reads as an empty array.
+func TestImageGenerationsFindsAFileThatOnlyTheDriveKnowsAbout(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/message"):
+			w.Header().Set("content-type", "text/event-stream")
+			_, _ = io.WriteString(w, upstreamText(`Got it — 2048×2048 PNG, saved to the workspace.
+<deliver-assets>
+<media src="/workspace/red_apple.png" caption="Red apple" />
+</deliver-assets>`))
+		case strings.HasSuffix(r.URL.Path, "/input-summaries"):
+			w.Header().Set("content-type", "application/json")
+			_, _ = io.WriteString(w, `{"summaries":[{"artifacts":[`+
+				`{"category":"images","file_ext":"png","mime_type":"image/png",`+
+				`"name":"red_apple.png","node_id":"444166461083748",`+
+				`"size_bytes":801051,"created_at":9999999999999}]}],`+
+				`"base_resp":{"status_code":0,"status_msg":"ok"}}`)
+		case strings.HasSuffix(r.URL.Path, "/download-url"):
+			w.Header().Set("content-type", "application/json")
+			// The drive answers without a scheme; the gateway has to add one.
+			_, _ = io.WriteString(w, `{"download_url":"matrix-internal.oss.example/Mavis/1/files/2/apple.png?sig=x",`+
+				`"base_resp":{"status_code":0,"status_msg":"ok"}}`)
+		default:
+			w.Header().Set("content-type", "application/json")
+			_, _ = io.WriteString(w, `{"session_id":"sess_test"}`)
+		}
+	})
+	h.addAccount(t, "primary", "token-good", 10)
+
+	raw, _ := json.Marshal(map[string]any{"prompt": "a red apple on a wooden table"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(raw))
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("authorization", "Bearer "+h.key)
+	rec := httptest.NewRecorder()
+	h.gateway.ImageGenerations(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeJSON(t, rec)
+	if payload["status"] != "succeeded" {
+		t.Fatalf("status = %v, want succeeded (body %s)", payload["status"], rec.Body.String())
+	}
+	data, _ := payload["data"].([]any)
+	if len(data) != 1 {
+		t.Fatalf("data = %v, want the one image the drive knows about", payload["data"])
+	}
+	first, _ := data[0].(map[string]any)
+	if first["url"] != "https://matrix-internal.oss.example/Mavis/1/files/2/apple.png?sig=x" {
+		t.Errorf("url = %v, want the drive link with a scheme", first["url"])
+	}
+}
+
 // An inline data URI is uploaded and attached by the key the upload returned.
 //
 // The upstream stopped accepting an external URL — an attachment must name an

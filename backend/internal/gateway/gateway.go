@@ -822,11 +822,12 @@ func (g *Gateway) runImageTurn(
 	ctx context.Context,
 	prompt string,
 	images []minimax.UploadedImage,
-) (*minimax.Result, string, error) {
+) (*minimax.Result, string, minimax.Credential, error) {
 	settings := g.settings()
 	var (
 		lastErr     error
 		accountName string
+		usedCred    minimax.Credential
 		result      *minimax.Result
 	)
 
@@ -837,8 +838,10 @@ func (g *Gateway) runImageTurn(
 			break
 		}
 		accountName = displayName(lease.Account)
+		usedCred = CredentialOf(lease.Account)
+		started := time.Now()
 		result, err = g.client.Completion(ctx, minimax.Options{
-			Credential:  CredentialOf(lease.Account),
+			Credential:  usedCred,
 			Text:        prompt,
 			Mode:        "image",
 			Images:      images,
@@ -849,14 +852,27 @@ func (g *Gateway) runImageTurn(
 
 		lastErr = err
 		if err == nil || isPoolExhausted(err) {
+			// The picture a turn produces is usually not in the stream. The
+			// agent answers with prose and a <media src="/workspace/…"> tag and
+			// leaves the file in the account's drive, so the drive is asked for
+			// anything created during this turn — the same lookup the video
+			// endpoint has always done. A live turn made this concrete: the
+			// response said "2048×2048 PNG, saved to the workspace" while the
+			// stream carried no URL at all, and without this the endpoint
+			// reported a paid success as an empty array.
+			if err == nil && result != nil && result.SessionID != "" {
+				if fromDrive, derr := g.client.SessionMedia(ctx, usedCred, result.SessionID, started.UnixMilli()); derr == nil {
+					result.Media = mergeMedia(result.Media, fromDrive)
+				}
+			}
 			break
 		}
 	}
 
 	if lastErr != nil {
-		return nil, accountName, lastErr
+		return nil, accountName, usedCred, lastErr
 	}
-	return result, accountName, nil
+	return result, accountName, usedCred, nil
 }
 
 // chatImage answers a chat completion whose model is an image model.
@@ -882,7 +898,7 @@ func (g *Gateway) chatImage(
 	body []byte,
 	started time.Time,
 ) {
-	result, accountName, err := g.runImageTurn(r.Context(), prompt, images)
+	result, accountName, _, err := g.runImageTurn(r.Context(), prompt, images)
 	if err != nil {
 		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, 0, 0, request.Stream, 0, string(body), "", err.Error())
 		if out.wroteHeader {
@@ -1054,7 +1070,7 @@ func (g *Gateway) ImageGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	settings := g.settings()
-	result, accountName, err := g.runImageTurn(r.Context(), request.Prompt, nil)
+	result, accountName, _, err := g.runImageTurn(r.Context(), request.Prompt, nil)
 	if err != nil {
 		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, 0, 0, false, 0, string(body), "", err.Error())
 		writeError(out, http.StatusBadGateway, err.Error())
