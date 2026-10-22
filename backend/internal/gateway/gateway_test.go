@@ -940,6 +940,12 @@ func TestImageGenerationsReturnsMedia(t *testing.T) {
 	if first["url"] != "https://cdn/one.png" {
 		t.Fatalf("url = %v", first["url"])
 	}
+	if payload["status"] != "succeeded" {
+		t.Errorf("status = %v, want succeeded", payload["status"])
+	}
+	if _, present := payload["detail"]; present {
+		t.Errorf("a succeeded turn still carried prose: %v", payload["detail"])
+	}
 }
 
 // A client cannot learn from /v1/models that an image model is an image model —
@@ -1146,6 +1152,32 @@ func TestImageGenerationsIgnoresTheModelAndCountFields(t *testing.T) {
 	// that is what the caller asked for.
 	if data, _ := decodeJSON(t, rec)["data"].([]any); len(data) != 1 {
 		t.Fatalf("data = %v, want the 1 image the turn produced", decodeJSON(t, rec)["data"])
+	}
+}
+
+// A turn that produced no picture is still a 200 — the agent is the only party
+// that knows why, so its answer has to travel back in `detail`. An empty `data`
+// with no explanation is the failure mode that costs an hour of guessing.
+func TestImageGenerationsReportsPendingWhenNothingIsProduced(t *testing.T) {
+	h := newHarness(t, acceptsEverything(upstreamText("这个账号没有图像生成工具")))
+	h.addAccount(t, "primary", "token-good", 10)
+
+	raw, _ := json.Marshal(map[string]any{"prompt": "一只在花园里散步的猫"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(raw))
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("authorization", "Bearer "+h.key)
+	rec := httptest.NewRecorder()
+	h.gateway.ImageGenerations(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("an empty turn is not an error: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeJSON(t, rec)
+	if payload["status"] != "pending" {
+		t.Errorf("status = %v, want pending", payload["status"])
+	}
+	if detail, _ := payload["detail"].(string); !strings.Contains(detail, "没有图像生成工具") {
+		t.Errorf("the agent's own answer was dropped: %v", payload["detail"])
 	}
 }
 

@@ -1081,6 +1081,17 @@ func (g *Gateway) ImageGenerations(w http.ResponseWriter, r *http.Request) {
 	g.store.RecordModelUsage(model.ID, 1, 0)
 	g.store.BumpClientKeyUsage(key.ID)
 	response := map[string]any{"created": time.Now().Unix(), "data": items}
+	// Same contract as the video endpoint: a turn that produced no picture is
+	// still a 200, and the agent's own words are the only thing that says why.
+	// Without `detail`, an empty `data` is indistinguishable from "the prompt
+	// was ignored", and nobody can look it up afterwards — the audit log stores
+	// this response, not the upstream turn.
+	if len(items) > 0 {
+		response["status"] = "succeeded"
+	} else {
+		response["status"] = "pending"
+		response["detail"] = result.Text
+	}
 	raw, _ := json.Marshal(response)
 	g.recordAudit(r, key, model, accountName, started, http.StatusOK, 0, 0, 0, false, 0, string(body), string(raw), "")
 
