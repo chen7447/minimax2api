@@ -255,12 +255,15 @@ func (s *Store) Save() error {
 // handle and a shutdown hook may both get there.
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
+		// Blocking send on purpose. The writer is either selecting — it takes
+		// this immediately — or mid-write, in which case it takes it as soon as
+		// that write returns. The old non-blocking send dropped the final flush
+		// whenever the writer happened to be busy, which is exactly how a
+		// completed sweep's stamp (and a fresh gallery entry) could vanish on
+		// restart, and why two tests failed only under load.
 		reply := make(chan error, 1)
-		select {
-		case s.flush <- reply:
-			<-reply
-		default:
-		}
+		s.flush <- reply
+		<-reply
 		close(s.closed)
 	})
 	s.wg.Wait()
