@@ -82,6 +82,81 @@ func (w *respWriter) Flush() {
 	}
 }
 
+// --------------------------------------------------- long-turn keepalive
+
+// keepAliveInterval is how often a byte is written while a long turn runs.
+//
+// Cloudflare's proxy read timeout is 125 seconds and fires when the origin has
+// sent nothing at all — not a cap on the total response. A live video turn
+// through the tunnel died at exactly 126s with a 524 while the same call to
+// 127.0.0.1:8080 took 137–297s, which is that rule and nothing else. A trickle
+// of whitespace keeps the connection alive; JSON allows leading whitespace, so
+// the document the client parses is unchanged.
+const keepAliveInterval = 10 * time.Second
+
+// keepAlive commits a 200 response up front and trickles whitespace until the
+// turn is done.
+//
+// Committing early has a cost: the status can no longer change, so a turn that
+// fails after this point has to say so in the body. That is why the video and
+// image endpoints answer 200 with status=failed instead of a 502 once the
+// keepalive is running — the alternative is an intermediary cutting the
+// connection before the turn can finish at all.
+type keepAlive struct {
+	out     *respWriter
+	flusher http.Flusher
+	stop    chan struct{}
+	done    chan struct{}
+	mu      sync.Mutex
+}
+
+func newKeepAlive(out *respWriter) *keepAlive {
+	flusher, _ := out.ResponseWriter.(http.Flusher)
+	return &keepAlive{out: out, flusher: flusher, stop: make(chan struct{}), done: make(chan struct{})}
+}
+
+func (k *keepAlive) start() {
+	k.out.Header().Set("content-type", "application/json")
+	k.out.Header().Set("cache-control", "no-store")
+	// nginx and friends buffer by default; ask them not to.
+	k.out.Header().Set("x-accel-buffering", "no")
+	k.out.WriteHeader(http.StatusOK)
+	k.flush()
+
+	go func() {
+		defer close(k.done)
+		ticker := time.NewTicker(keepAliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-k.stop:
+				return
+			case <-ticker.C:
+				k.mu.Lock()
+				_, _ = k.out.Write([]byte("\n"))
+				k.flush()
+				k.mu.Unlock()
+			}
+		}
+	}()
+}
+
+func (k *keepAlive) flush() {
+	if k.flusher != nil {
+		k.flusher.Flush()
+	}
+}
+
+// finish stops the trickle and writes the body.
+func (k *keepAlive) finish(body []byte) {
+	close(k.stop)
+	<-k.done
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	_, _ = k.out.Write(body)
+	k.flush()
+}
+
 // ------------------------------------------------------------- chat handler
 
 type chatRequest struct {
@@ -1093,10 +1168,22 @@ func (g *Gateway) ImageGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	settings := g.settings()
+	// From here on the turn can outlast an intermediary's read timeout, so the
+	// response is committed now and kept warm. Validation above still answers
+	// with a real status code; everything below answers 200 with a status field.
+	keep := newKeepAlive(out)
+	keep.start()
 	result, accountName, _, err := g.runImageTurn(r.Context(), request.Prompt, nil)
 	if err != nil {
-		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, 0, 0, false, 0, string(body), "", err.Error())
-		writeError(out, http.StatusBadGateway, err.Error())
+		failure := map[string]any{
+			"created": time.Now().Unix(),
+			"status":  "failed",
+			"detail":  err.Error(),
+			"data":    []any{},
+		}
+		raw, _ := json.Marshal(failure)
+		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, 0, 0, false, 0, string(body), string(raw), err.Error())
+		keep.finish(raw)
 		return
 	}
 
@@ -1133,10 +1220,7 @@ func (g *Gateway) ImageGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 	raw, _ := json.Marshal(response)
 	g.recordAudit(r, key, model, accountName, started, http.StatusOK, 0, 0, 0, false, 0, string(body), string(raw), "")
-
-	out.Header().Set("content-type", "application/json")
-	out.WriteHeader(http.StatusOK)
-	_, _ = out.Write(raw)
+	keep.finish(raw)
 }
 
 // ------------------------------------------------------------ video handler
@@ -1242,6 +1326,12 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 
 	prompt := g.outgoingText(settings, model, request.Prompt, options)
 
+	// A video turn legitimately runs for minutes, which is past Cloudflare's
+	// 125s proxy read timeout. Commit the response now and keep it warm; the
+	// validation above still returns real status codes.
+	keep := newKeepAlive(out)
+	keep.start()
+
 	var (
 		lastErr     error
 		accountName string
@@ -1273,8 +1363,18 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if lastErr != nil {
-		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, 0, 0, false, 0, string(body), "", lastErr.Error())
-		writeError(out, http.StatusBadGateway, lastErr.Error())
+		failure := map[string]any{
+			"created": time.Now().Unix(),
+			"model":   model.ID,
+			"status":  "failed",
+			"detail":  lastErr.Error(),
+			"data":    []any{},
+		}
+		raw, _ := json.Marshal(failure)
+		// The audit keeps the real outcome (502) even though the wire status is
+		// already 200: the log is what the operator scans for failures.
+		g.recordAudit(r, key, model, accountName, started, http.StatusBadGateway, 0, 0, 0, false, 0, string(body), string(raw), lastErr.Error())
+		keep.finish(raw)
 		return
 	}
 
@@ -1331,10 +1431,7 @@ func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 	raw, _ := json.Marshal(response)
 	g.recordAudit(r, key, model, accountName, started, http.StatusOK, 0, 0, 0, false, 0, string(body), string(raw), "")
-
-	out.Header().Set("content-type", "application/json")
-	out.WriteHeader(http.StatusOK)
-	_, _ = out.Write(raw)
+	keep.finish(raw)
 }
 
 // defaultVideoModel is used when a caller names none. It is the fast variant:
