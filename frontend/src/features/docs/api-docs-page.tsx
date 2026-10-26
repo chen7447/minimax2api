@@ -104,7 +104,10 @@ data: [DONE]`,
 }
 
 // 没出图时：Agent 的原话在 detail 里
-{ "created": 1792667805, "status": "pending", "detail": "……", "data": [] }`,
+{ "created": 1792667805, "status": "pending", "detail": "……", "data": [] }
+
+// 轮次失败：保活已开始，HTTP 仍是 200
+{ "created": 1792667805, "status": "failed", "detail": "……", "data": [] }`,
     parameters: [
       { name: "prompt", type: "string", required: true, noteKey: "docs.notePrompt" },
       { name: "response_format", type: "string", noteKey: "docs.noteResponseFormat" },
@@ -146,6 +149,15 @@ data: [DONE]`,
   "created": 1792666573,
   "model": "minimax-h3",
   "status": "pending",
+  "detail": "……",
+  "data": []
+}
+
+// 轮次失败：保活已开始，HTTP 仍是 200，审计里仍记 502
+{
+  "created": 1792666573,
+  "model": "minimax-h3-max",
+  "status": "failed",
   "detail": "……",
   "data": []
 }`,
